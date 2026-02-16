@@ -1,0 +1,43 @@
+{
+    __meta__ = {
+        version = "1.0"
+    },
+    ["windows|x64"] = {
+        ["boost 1.86.0#07bc8cd6"] = {
+            version = "1.86.0"
+        },
+        ["cmake#f56260b5"] = {
+            version = "4.2.0"
+        },
+        ["fmt#f56260b5"] = {
+            version = "12.1.0"
+        },
+        ["frozen#f56260b5"] = {
+            version = "1.2.0"
+        },
+        ["infoware#af2e788d"] = {
+            version = "2023.04.12"
+        },
+        ["magic_enum 0.8.2#f56260b5"] = {
+            version = "v0.8.2"
+        },
+        ["ninja#f56260b5"] = {
+            version = "1.12.1"
+        },
+        ["simpleini v4.25#f56260b5"] = {
+            version = "v4.25"
+        },
+        ["spdlog v1.16.0#09c8c173"] = {
+            version = "v1.16.0"
+        },
+        ["xbyak v7.06#f56260b5"] = {
+            version = "v7.06"
+        },
+        ["zycore-c v1.1.0#f56260b5"] = {
+            version = "v1.1.0"
+        },
+        ["zydis 3.2.1#f56260b5"] = {
+            version = "v3.2.1"
+        }
+    }
+}
