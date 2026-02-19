@@ -1,4 +1,4 @@
-#include "CrashHandler.h"
+﻿#include "CrashHandler.h"
 
 #include "Introspection/Introspection.h"
 #include "Modules/ModuleHandler.h"
@@ -53,6 +53,7 @@ namespace Crash
 {
 	// Config Options
 	static REX::INI::Bool bWaitForDebugger{ "CrashLogger"sv, "bWaitForDebugger"sv, false };
+	static REX::INI::Bool bBotCompatibilityMode{ "CrashLogger"sv, "bBotCompatibilityMode"sv, true };
 
 	class SEHException : public std::exception
 	{
@@ -459,25 +460,32 @@ namespace Crash
 			}
 		}
 
-		void print_settings(spdlog::logger& a_log)
+		void print_settings(spdlog::logger& a_log, bool BotCompatMode)
 		{
-			std::filesystem::path AddictolTOMLFile = "Data/F4SE/Plugins/Addictol.toml";
-
-			if (!std::filesystem::exists(AddictolTOMLFile))
+			std::filesystem::path ConfigFile = "Data/F4SE/Plugins/Addictol.toml";
+		
+			if (!std::filesystem::exists(ConfigFile))
 			{
-				REX::WARN("Addictol's TOML File was not found at: {}", AddictolTOMLFile.string());
+				REX::WARN("Config File was not found at: {}", ConfigFile.string());
 				return;
 			}
 
-			std::ifstream file(AddictolTOMLFile);
+			std::ifstream file(ConfigFile);
 			if (!file.is_open())
 			{
-				REX::WARN("Failed to open Addictol's TOML File at: {}", AddictolTOMLFile.string());
+				REX::WARN("Failed to open the Config File at: {}", ConfigFile.string());
 				return;
 			}
 
+			std::unordered_map<std::string, std::string> MainValues;
 			std::string line;
 			std::string current_group;
+
+			auto trim = [](std::string& s)
+				{
+					s.erase(0, s.find_first_not_of(" \t"));
+					s.erase(s.find_last_not_of(" \t") + 1);
+				};
 
 			while (std::getline(file, line))
 			{
@@ -493,8 +501,11 @@ namespace Crash
 				// [GroupName]
 				if (line.front() == '[' && line.back() == ']')
 				{
-					current_group = line.substr(1, line.size() - 2);
-					a_log.critical("\t[{}]", current_group);
+					if (!BotCompatMode)
+					{
+						current_group = line.substr(1, line.size() - 2);
+						a_log.critical("\t[{}]", current_group);
+					}
 
 					continue;
 				}
@@ -514,15 +525,142 @@ namespace Crash
 				}
 
 				// Trim Whitespace
-				auto trim = [](std::string& s)
-					{
-						s.erase(0, s.find_first_not_of(" \t"));
-						s.erase(s.find_last_not_of(" \t") + 1);
-					};
-
+				trim(key);
 				trim(value);
 
-				a_log.critical("\t\t{}: {}", key, value);
+				if (!BotCompatMode)
+					a_log.critical("\t\t{}: {}", key, value);
+				else
+					MainValues[key] = value;
+			}
+
+			// Compatibility Mode Config
+			if (BotCompatMode)
+			{
+				// Open the Config
+				ConfigFile = "Data/F4SE/Plugins/CompatibilityModeConfig.toml";
+
+				if (!std::filesystem::exists(ConfigFile))
+				{
+					REX::WARN("Compatibility Config File was not found at: {}", ConfigFile.string());
+					return;
+				}
+
+				std::ifstream compatibilityFile(ConfigFile);
+				if (!compatibilityFile.is_open())
+				{
+					REX::WARN("Failed to open the Compatibility Config File at: {}", ConfigFile.string());
+					return;
+				}
+
+				// Add some missing Settings
+				MainValues["bWaitForDebugger"] = bWaitForDebugger.GetValue() ? "true" : "false";
+				MainValues["sSymcache"] = PDB::sSymcache.GetValue();
+
+				// F4EE is fixed in NG / AE
+				if (REL::Module::IsRuntimeOG())
+					MainValues["bF4EE"] = "false";
+				else
+					MainValues["bF4EE"] = "true";
+
+				// Key Map
+				const std::unordered_map<std::string, std::string> KeyMap =
+				{
+					// Compatibility
+					{"F4EE", "bF4EE"},
+
+					// Debug
+					{"Symcache", "sSymcache"},
+					{"WaitForDebugger", "bWaitForDebugger"},
+
+					// Fixes
+					{"ActorIsHostileToActor", "bActorIsHostileToActor"},
+					{"BGSAIWorldLocationRefRadiusNull", "bBGSAIWorldLocationRefRadius"},
+					{"CellInit", "bCellInit"},
+					{"CreateD3DAndSwapChain", "bCreateD3DAndSwapchain"},
+					{"EncounterZoneReset", "bEncounterZoneReset"},
+					{"GreyMovies", "bGreyMovies"},
+					{"EscapeFreeze", "bEscapeFreeze"},
+					{"InteriorNavCut", "bInteriorNavCut"},
+					{"FixScriptPageAllocation", "bBakaMaxPapyrusOps"},
+					{"FixToggleScriptsCommand", "bBakaMaxPapyrusOps"},
+					{"MagicEffectApplyEvent", "bMagicEffectApplyEvent"},
+					{"MovementPlanner", "bMovementPlanner"},
+					{"PackageAllocateLocation", "bPackageAllocateLocation"},
+					{"SafeExit", "bSafeExit"},
+					{"TESObjectREFRGetEncounterZone", "bTESObjectREFRGetEncounterZone"},
+					{"UnalignedLoad", "bUnalignedLoad"},
+					{"WorkBenchSwap", "bWorkbenchSwap"},
+					{"PipboyLightInvFix", "bPipBoyLightInv"},
+
+					// Patches
+					{"Achievements", "bAchievements"},
+					{"BSMTAManager", "bBSMTAManager"},
+					{"BSPreCulledObjects", "bBSPreCulledObjects"},
+					{"INISettingCollection", "bINISettingCollection"},
+					{"InputSwitch", "bInputSwitch"},
+					{"MaxStdIO", "nMaxStdIO"},
+					{"MemoryManager", "bMemoryManager"},
+					{"ScaleformAllocator", "bScaleformAllocator"},
+					{"SmallBlockAllocator", "bSmallBlockAllocator"},
+
+					// Tweaks
+					{"MaxPapyrusOpsPerFrame", "nMaxPapyrusOpsPerFrame"},
+
+					// Warnings
+					{"ImageSpaceAdapter", "bImageSpaceAdapter"},
+				};
+
+				// Config
+				while (std::getline(compatibilityFile, line))
+				{
+					while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+					{
+						line.pop_back();
+					}
+
+					// Ignore Empty Lines and Comments
+					if (line.empty()) continue;
+					if (line[0] == ';' || line[0] == '#') continue;
+
+					// [GroupName]
+					if (line.front() == '[' && line.back() == ']')
+					{
+						current_group = line.substr(1, line.size() - 2);
+						a_log.critical("\t[{}]", current_group);
+
+						continue;
+					}
+
+					// Key/Value
+					auto eq_pos = line.find('=');
+					if (eq_pos == std::string::npos) continue;
+
+					std::string key = line.substr(0, eq_pos);
+					std::string value = line.substr(eq_pos + 1);
+
+					// Strip Inline Comments
+					auto comment_pos = value.find_first_of("#;");
+					if (comment_pos != std::string::npos)
+					{
+						value = value.substr(0, comment_pos);
+					}
+
+					// Trim Whitespace
+					trim(key);
+					trim(value);
+
+					// Override Values
+					auto it = KeyMap.find(key);
+					if (it != KeyMap.end())
+					{
+						if (MainValues.contains(it->second))
+							value = MainValues[it->second];
+					}
+
+					// Log
+					a_log.critical("\t\t{}: {}", key, value);
+				}
 			}
 		}
 
@@ -649,13 +787,17 @@ namespace Crash
 					log->flush();
 					};
 
+				bool BotCompatMode = bBotCompatibilityMode.GetValue();
 				const auto runtimeVer = REL::Module::GetSingleton()->version();
 				log->critical("Fallout 4 v{}.{}.{}"sv, runtimeVer[0], runtimeVer[1], runtimeVer[2]);
-				log->critical("Addictol v{}.{}.{} {} {}"sv, PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH, __DATE__, __TIME__);
+				if (!BotCompatMode)
+					log->critical("Addictol v{}.{}.{} {} {}"sv, PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH, __DATE__, __TIME__);
+				else
+					log->critical("Buffout 4 v{}.{}.{} {} {}"sv, PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH, __DATE__, __TIME__);
 				log->flush();
 
 				print([&]() { print_exception(*log, *a_exception->ExceptionRecord, cmodules); }, "print_exception");
-				print([&]() { print_settings(*log); }, "print_settings");
+				print([&]() { print_settings(*log, BotCompatMode); }, "print_settings");
 				print([&]() { print_sysinfo(*log); }, "print_sysinfo");
 
 				print(
@@ -670,6 +812,13 @@ namespace Crash
 				print([&]() { print_modules(*log, cmodules); }, "print_modules");
 				print([&]() { print_xse_plugins(*log, cmodules); }, "print_xse_plugins");
 				print([&]() { print_plugins(*log); }, "print_plugins");
+
+				// Print Actual Addictol Settings
+				if (BotCompatMode)
+				{
+					log->critical("\nAddictol Settings:"sv);
+					print([&]() { print_settings(*log, false); }, "print_settings");
+				}
 			}
 			catch (const SEHException& se) {
 				// Log the SEH exception converted to a C++ exception

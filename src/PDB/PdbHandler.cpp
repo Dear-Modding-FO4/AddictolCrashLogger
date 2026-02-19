@@ -14,9 +14,6 @@ namespace Crash
 {
 	namespace PDB
 	{
-		// Config Options
-		static REX::INI::Str sSymcache{ "CrashLogger"sv, "sSymcache"sv, std::string{"C:\\symcache"} };
-
 		std::atomic<bool> symcacheChecked = false;
 		std::atomic<bool> symcacheValid = false;
 		//https://stackoverflow.com/questions/6284524/bstr-to-stdstring-stdwstring-and-vice-versa
