@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  xmake:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: use dev cmd
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: setup
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: "latest"
+
+      - name: config
+        run: xmake config -y --mode=release --toolchain=msvc
+
+      - name: build
+        run: xmake build -y -vD
+
+      - name: Get Short SHA
+        run: echo "SHORT_SHA=$("${{ github.sha }}".SubString(0, 8))" >> $env:GITHUB_ENV
+
+      - name: Make Bundle Directory
+        working-directory: ${{env.GITHUB_WORKSPACE}}
+        run: New-Item -ItemType Directory -Path "AddictolCrashLogger-${{env.SHORT_SHA}}\F4SE\Plugins" -Force
+      
+      - name: Copy Build
+        working-directory: ${{env.GITHUB_WORKSPACE}}
+        run: Get-ChildItem -Recurse -Path ".\build\windows\x64\release" -Include "AddictolCrashLogger.dll" | ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path "AddictolCrashLogger-${{env.SHORT_SHA}}\F4SE\Plugins" $_.Name) -Force }
+
+      - name: Copy Data
+        working-directory: ${{env.GITHUB_WORKSPACE}}
+        run: Copy-Item -Path ".\data\*" -Destination "AddictolCrashLogger-${{env.SHORT_SHA}}\" -Recurse -Force
+
+      - name: Copy msdia140.dll
+        run: |
+          $diaDll = Join-Path $env:VSINSTALLDIR "DIA SDK\bin\amd64\msdia140.dll"
+          $dest   = "AddictolCrashLogger-${{ env.SHORT_SHA }}\F4SE\Plugins"
+          if (Test-Path $diaDll) {
+              Copy-Item -Path $diaDll -Destination $dest -Force
+          } else {
+              Write-Host "msdia140.dll not found at $diaDll"
+          }
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AddictolCrashLogger-${{env.SHORT_SHA}}
+          path: "AddictolCrashLogger-${{env.SHORT_SHA}}"
