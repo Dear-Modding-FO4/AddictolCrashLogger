@@ -103,19 +103,18 @@ namespace Crash::Modules
 				const auto start = reinterpret_cast<const std::uint32_t*>(base);
 				const auto end = reinterpret_cast<const std::uint32_t*>(base + a_rdata.size());
 
-				for (auto iter = start; iter < end; ++iter) {
+				for (auto iter = start; iter < end; ++iter)
+				{
 					if (*iter == rva) {
 						// both base class desc and col can point to the type desc so we check
 						// the next int to see if it can be an rva to decide which type it is
-						if ((iter[1] < offset) || (offset + a_rdata.size() <= iter[1])) {
+						if ((iter[1] < offset) || (offset + a_rdata.size() <= iter[1]))
 							continue;
-						}
 
 						const auto ptr = reinterpret_cast<const std::byte*>(iter);
 						const auto col = reinterpret_cast<const RE::RTTI::CompleteObjectLocator*>(ptr - offsetof(RE::RTTI::CompleteObjectLocator, typeDescriptor));
-						if (col->offset != 0) {
+						if (col->offset != 0)
 							continue;
-						}
 
 						return col;
 					}
@@ -136,10 +135,10 @@ namespace Crash::Modules
 				const auto start = reinterpret_cast<const std::uintptr_t*>(base);
 				const auto end = reinterpret_cast<const std::uintptr_t*>(base + a_rdata.size());
 
-				for (auto iter = start; iter < end; ++iter) {
-					if (*iter == col) {
+				for (auto iter = start; iter < end; ++iter)
+				{
+					if (*iter == col)
 						return iter + 1;
-					}
 				}
 
 				return nullptr;
@@ -166,13 +165,15 @@ namespace Crash::Modules
 					_offset2ID.rbegin(),
 					_offset2ID.rend(),
 					offset,
-					[](auto&& a_lhs, auto&& a_rhs) noexcept {
+					[](auto&& a_lhs, auto&& a_rhs) noexcept
+					{
 						return a_lhs.offset >= a_rhs;
 					});
 
 				auto result = super::get_frame_info(a_frame);
 				const auto assemblyStr = assembly(a_frame.address());
-				if (it != _offset2ID.rend()) {
+				if (it != _offset2ID.rend())
+				{
 					result += fmt::format(
 						" -> {}+0x{:X}"sv,
 						it->id,
@@ -195,12 +196,10 @@ namespace Crash::Modules
 				auto name = get_name(a_module);
 				const auto image = get_image(a_module);
 				const auto path = get_path(a_module);
-				if (_stricmp(name.c_str(), util::module_name().c_str()) == 0) {
+				if (_stricmp(name.c_str(), util::module_name().c_str()) == 0)
 					return result_t{ new Fallout4(std::move(name), image, std::move(path)) };
-				}
-				else {
+				else
 					return result_t{ new Module(std::move(name), image, std::move(path)) };
-				}
 			}
 
 		private:
@@ -217,7 +216,8 @@ namespace Crash::Modules
 				buf.reserve(MAX_PATH);
 				buf.resize(MAX_PATH / 2);
 				std::uint32_t result = 0;
-				do {
+				do
+				{
 					buf.resize(buf.size() * 2);
 					result = ::GetModuleFileNameW(
 						a_module,
@@ -234,7 +234,8 @@ namespace Crash::Modules
 				buf.reserve(MAX_PATH);
 				buf.resize(MAX_PATH / 2);
 				std::uint32_t result = 0;
-				do {
+				do
+				{
 					buf.resize(buf.size() * 2);
 					result = ::GetModuleFileNameW(
 						a_module,
@@ -255,31 +256,21 @@ namespace Crash::Modules
 
 	std::string Module::assembly(const void* a_ptr) const
 	{
-		// Zydis code from https://github.com/zyantific/zydis/tree/v3.2.1#quick-example under MIT
-		// Initialize decoder context
-		ZydisDecoder decoder;
-		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
-		// Initialize formatter. Only required when you actually plan to do instruction
-		// formatting ("disassembling"), like we do here
-		ZydisFormatter formatter;
-		ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+		// Zydis code from https://github.com/zyantific/zydis/blob/214536a814ba20d2e33d2a907198d1a329aac45c/examples/DisassembleSimple.c#L38-L63 under MIT
 
 		ZyanUSize offset = 0;
 		ZyanU8 data[8];
 		ZyanU64 runtime_address = (ZyanU64)a_ptr;
 		memcpy(data, (const void*)runtime_address, sizeof(data));
-		const ZyanUSize length = sizeof(data);
-		ZydisDecodedInstruction instruction;
 		std::string assembly = "";
-		if (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&decoder, data + offset, length - offset,
-			&instruction))) {  // Grab only one instruction
-			// Format & convert the binary instruction structure to human readable format
-			char buffer[256];
-			ZydisFormatterFormatInstruction(&formatter, &instruction, buffer, sizeof(buffer),
-				runtime_address);
-			assembly = std::format("{}", buffer);
-			//offset += instruction.length;
-			//runtime_address += instruction.length;
+		ZydisDisassembledInstruction instruction;
+		if (ZYAN_SUCCESS(ZydisDisassembleIntel(
+			/* machine_mode:    */ ZYDIS_MACHINE_MODE_LONG_64,
+			/* runtime_address: */ runtime_address,
+			/* buffer:          */ data + offset,
+			/* length:          */ sizeof(data) - offset,
+			/* instruction:     */ &instruction))) {
+			assembly = std::format("{}", instruction.text);
 		}
 		return assembly;
 	}
@@ -299,23 +290,25 @@ namespace Crash::Modules
 			std::make_pair(".data"sv, std::ref(_data)),
 			std::make_pair(".rdata"sv, std::ref(_rdata)),
 		};
-		for (auto& [name, section] : todo) {
+		for (auto& [name, section] : todo)
+		{
 			const auto it = std::find_if(
 				sections.begin(),
 				sections.end(),
-				[&](auto&& a_elem) {
+				[&](auto&& a_elem)
+				{
 					constexpr auto size = std::extent_v<decltype(a_elem.Name)>;
 					const auto len = std::min(name.size(), size);
 					return std::memcmp(name.data(), a_elem.Name, len) == 0;
 				});
-			if (it != sections.end()) {
+			if (it != sections.end())
 				section = std::span{ it->VirtualAddress + _image.data(), it->SizeOfRawData };
-			}
 		}
 
 		if (!_image.empty() &&
 			!_data.empty() &&
-			!_rdata.empty()) {
+			!_rdata.empty())
+		{
 			detail::VTable v{ ".?AVtype_info@@"sv, _image, _data, _rdata };
 			_typeInfo = static_cast<const RE::msvc::type_info*>(v.get());
 		}
@@ -326,12 +319,14 @@ namespace Crash::Modules
 		const auto offset = reinterpret_cast<std::uintptr_t>(a_frame.address()) - address();
 		const auto assembly = this->assembly(a_frame.address());
 		const auto pdbDetails = Crash::PDB::pdb_details(path(), offset);
+		const auto pdbParams = Crash::PDB::pdb_function_parameters(path(), offset);
 		if (!pdbDetails.empty())
 			return fmt::format(
-				"+{:07X}\t{} | {}"sv,
+				"+{:07X}\t{} | {}{}"sv,
 				offset,
 				assembly,
-				pdbDetails);
+				pdbDetails,
+				pdbParams.empty() ? ""s : fmt::format(" | params: {}", pdbParams));
 		return fmt::format(
 			"+{:07X}"sv,
 			offset);
@@ -343,7 +338,8 @@ namespace Crash::Modules
 		const auto proc = ::GetCurrentProcess();
 		std::vector<::HMODULE> modules;
 		std::uint32_t needed = 0;
-		do {
+		do
+		{
 			modules.resize(needed / sizeof(::HMODULE));
 			::K32EnumProcessModules(
 				proc,
@@ -358,14 +354,16 @@ namespace Crash::Modules
 			std::execution::par_unseq,
 			modules.begin(),
 			modules.end(),
-			[&](auto&& a_elem) {
+			[&](auto&& a_elem)
+			{
 				const auto pos = std::addressof(a_elem) - modules.data();
 				results[pos] = detail::Factory::create(a_elem);
 			});
 		std::sort(
 			results.begin(),
 			results.end(),
-			[](auto&& a_lhs, auto&& a_rhs) noexcept {
+			[](auto&& a_lhs, auto&& a_rhs) noexcept
+			{
 				return a_lhs->address() < a_rhs->address();
 			});
 

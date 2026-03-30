@@ -1,5 +1,6 @@
 #include "Introspection/Introspection.h"
 
+#include "Introspection/HeapAnalysis.h"
 #include "Modules/ModuleHandler.h"
 #include "PDB/PdbHandler.h"
 #define MAGIC_ENUM_RANGE_MAX 256
@@ -12,6 +13,17 @@ namespace Crash::Introspection::F4
 	[[nodiscard]] std::string quoted(std::string_view a_str)
 	{
 		return fmt::format("\"{}\""sv, a_str);
+	}
+
+	[[nodiscard]] std::string truncate_string(std::string_view a_str, std::size_t a_max)
+	{
+		if (a_str.size() <= a_max) {
+			return std::string(a_str);
+		}
+		if (a_max <= 3) {
+			return std::string(a_str.substr(0, a_max));
+		}
+		return fmt::format("{}..."sv, a_str.substr(0, a_max - 3));
 	}
 
 	namespace BSResource
@@ -776,6 +788,48 @@ namespace Crash::Introspection
 
 	namespace detail
 	{
+		struct SeenObjectInfo
+		{
+			std::string result;
+			std::size_t first_seen_pos;
+			std::string first_seen_label;  // Store the label string to avoid recalculation issues across blocks. Must be initialized at the same time as first_seen_pos to ensure consistency.
+			bool is_game_object;           // True for polymorphic game objects, false for void* with module info
+		};
+		static std::unordered_map<const void*, SeenObjectInfo> seen_objects;
+		static std::mutex seen_objects_mutex;  // Protects seen_objects from race conditions
+		static std::function<std::string(size_t)> label_generator;
+		static thread_local std::size_t current_analysis_pos = 0;
+		static std::size_t total_backfill_count = 0;
+		static bool backfill_logged_this_crash = false;
+
+		// Generate a label for the current position
+		// Uses label_generator if available, otherwise falls back to address string
+		// Uses thread_local current_analysis_pos so each thread gets its own position; overall thread-safety depends on label_generator
+		[[nodiscard]] inline std::string generate_current_label(const void* a_ptr)
+		{
+			return label_generator ? label_generator(current_analysis_pos) : fmt::format("0x{:X}", reinterpret_cast<std::uintptr_t>(a_ptr));
+		}
+
+		// Check if a demangled type name is a game-relevant object
+		// Returns false for STL types, internal implementation classes, etc.
+		[[nodiscard]] bool is_game_relevant_type(std::string_view demangled) noexcept
+		{
+			// Filter out STL and internal implementation types
+			// Check for std:: prefix or common STL internal patterns
+			if (demangled.starts_with("std::") ||
+				demangled.find("std::_") != std::string_view::npos ||
+				demangled.starts_with("_Ref_count")) {
+				return false;
+			}
+			if (demangled.starts_with("_")) {
+				// Internal implementation classes
+				return false;
+			}
+			// Game-relevant types typically start with known prefixes
+			// RE::, BSScript::, hk, Ni, etc.
+			return true;
+		}
+
 		class Integer
 		{
 		public:
@@ -783,9 +837,7 @@ namespace Crash::Introspection
 				_value(a_value),
 				name_string(a_value >> 63 ?
 					fmt::format(fmt::runtime("(size_t) [uint: {} int: {}]"s), _value, static_cast<std::make_signed_t<size_t>>(_value)) :
-					fmt::format(fmt::runtime("(size_t) [{}]"s), _value))
-			{
-			}
+					fmt::format(fmt::runtime("(size_t) [{}]"s), _value)) {}
 
 			[[nodiscard]] std::string name() const { return name_string; }
 
@@ -802,33 +854,50 @@ namespace Crash::Introspection
 			Pointer(const void* a_ptr, std::span<const module_pointer> a_modules) noexcept :
 				_module(get_module_for_pointer(a_ptr, a_modules))
 			{
-				if (_module) {
+				if (_module)
 					_ptr = a_ptr;
-				}
 			}
 
 			[[nodiscard]] std::string name() const
 			{
-				if (_module) {
+				// Check if this address was already introspected as a known object
+				{
+					std::lock_guard<std::mutex> lock(seen_objects_mutex);
+					auto it = seen_objects.find(_ptr);
+					if (it != seen_objects.end() && !it->second.result.empty())
+						return it->second.result;  // Return the full object information
+				}
+
+				if (_module)
+				{
 					const auto address = reinterpret_cast<std::uintptr_t>(_ptr);
 					const auto pdbDetails = Crash::PDB::pdb_details(_module->path(), address - _module->address());
 					const auto assembly = _module->assembly((const void*)address);
+					std::string result;
 					if (!pdbDetails.empty())
-						return fmt::format(
+						result = fmt::format(
 							"(void* -> {}+{:07X}\t{} | {})"sv,
 							_module->name(),
 							address - _module->address(),
 							assembly,
 							pdbDetails);
-					return fmt::format(
-						"(void* -> {}+{:07X}\t{})"sv,
-						_module->name(),
-						address - _module->address(),
-						assembly);
+					else
+						result = fmt::format(
+							"(void* -> {}+{:07X}\t{})"sv,
+							_module->name(),
+							address - _module->address(),
+							assembly);
+
+					// Store in seen_objects to prevent duplicate introspection
+					// Mark as NOT a game object (just a void* with module info)
+					{
+						std::lock_guard<std::mutex> lock(seen_objects_mutex);
+						seen_objects.try_emplace(_ptr, result, current_analysis_pos, generate_current_label(_ptr), false);
+					}
+					return result;
 				}
-				else {
+				else
 					return "(void*)"s;
-				}
 			}
 
 		private:
@@ -839,53 +908,60 @@ namespace Crash::Introspection
 		class Polymorphic
 		{
 		public:
-			explicit Polymorphic(std::string_view a_mangled) noexcept :
-				_mangled{ a_mangled }
+			explicit Polymorphic(std::string_view a_mangled, const void* a_ptr = nullptr) noexcept :
+				_mangled{ a_mangled },
+				_ptr{ a_ptr }
 			{
 				// NOLINTNEXTLINE(readability-simplify-subscript-expr)
 				assert(_mangled.size() > 1 && _mangled.data()[_mangled.size()] == '\0');
 			}
 
+			void set_header(std::string a_header) noexcept { _header = std::move(a_header); }
+
+			[[nodiscard]] std::string demangled_name() const { return Crash::PDB::demangle(std::string{ _mangled }); }
+
+			[[nodiscard]] std::string get_formatted_name() const
+			{
+				const std::string demangled = demangled_name();
+				return _header.empty() ? fmt::format("({}*)"sv, demangled) : _header;
+			}
+
 			[[nodiscard]] std::string name() const
 			{
-				const auto demangle = [](const char* a_in, char* a_out, std::uint32_t a_size) {
-					static std::mutex m;
-					std::lock_guard l{ m };
-					return WinAPI::UnDecorateSymbolName(
-						a_in,
-						a_out,
-						a_size,
-						(WinAPI::UNDNAME_NO_MS_KEYWORDS) |
-						(WinAPI::UNDNAME_NO_FUNCTION_RETURNS) |
-						(WinAPI::UNDNAME_NO_ALLOCATION_MODEL) |
-						(WinAPI::UNDNAME_NO_ALLOCATION_LANGUAGE) |
-						(WinAPI::UNDNAME_NO_THISTYPE) |
-						(WinAPI::UNDNAME_NO_ACCESS_SPECIFIERS) |
-						(WinAPI::UNDNAME_NO_THROW_SIGNATURES) |
-						(WinAPI::UNDNAME_NO_RETURN_UDT_MODEL) |
-						(WinAPI::UNDNAME_NAME_ONLY) |
-						(WinAPI::UNDNAME_NO_ARGUMENTS) |
-						static_cast<std::uint32_t>(0x8000));  // Disable enum/class/struct/union prefix
-					};
+				auto result = get_formatted_name();
 
-				std::array<char, 0x1000> buf{ '\0' };
-				const auto len = demangle(
-					_mangled.data() + 1,
-					buf.data(),
-					static_cast<std::uint32_t>(buf.size()));
+				// Check if this address was already introspected
+				if (_ptr)
+				{
+					// Determine if this is a game object before acquiring the lock
+					const std::string demangled = demangled_name();
+					bool is_game_obj = is_game_relevant_type(demangled);
 
-				if (len != 0) {
-					return fmt::format(
-						"({}*)"sv,
-						std::string_view{ buf.data(), len });
+					// Use check-and-reserve pattern
+					{
+						std::lock_guard<std::mutex> lock(seen_objects_mutex);
+						auto [it, inserted] = seen_objects.try_emplace(_ptr, SeenObjectInfo{ result, current_analysis_pos, generate_current_label(_ptr), is_game_obj });
+
+						if (!inserted)
+						{
+							// If we're at the same position where it was first seen, return the stored result
+							if (current_analysis_pos == it->second.first_seen_pos)
+								return it->second.result;
+
+							// Object already being processed or completed - return cross-reference
+							return fmt::format("{} See {}", result, it->second.first_seen_label);
+						}
+						// else: we successfully stored this object, return the result
+					}
 				}
-				else {
-					return "(ERROR)"s;
-				}
+
+				return result;
 			}
 
 		private:
 			std::string_view _mangled;
+			const void* _ptr{ nullptr };
+			std::string _header;
 		};
 
 		class F4Polymorphic
@@ -895,7 +971,7 @@ namespace Crash::Introspection
 				std::string_view a_mangled,
 				const RE::RTTI::CompleteObjectLocator* a_col,
 				const void* a_ptr) noexcept :
-				_poly{ a_mangled },
+				_poly{ a_mangled, a_ptr },
 				_col{ a_col },
 				_ptr{ a_ptr }
 			{
@@ -903,9 +979,48 @@ namespace Crash::Introspection
 				assert(_ptr != nullptr);
 			}
 
+			void set_header(std::string a_header) noexcept { _poly.set_header(std::move(a_header)); }
+			[[nodiscard]] std::string demangled_name() const { return _poly.demangled_name(); }
+
 			[[nodiscard]] std::string name() const
 			{
-				auto result = _poly.name();
+				std::size_t reserved_pos = 0;
+				bool was_inserted = false;
+
+				// Use check-and-reserve pattern to prevent re-entrancy
+				{
+					std::lock_guard<std::mutex> lock(seen_objects_mutex);
+					auto [it, inserted] = seen_objects.try_emplace(_ptr, SeenObjectInfo{ "", current_analysis_pos, generate_current_label(_ptr), true });
+					was_inserted = inserted;
+					reserved_pos = current_analysis_pos;
+
+					if (!inserted)
+					{
+						// Object already exists (either being processed or completed)
+
+						// If we're at the same position where it was first seen, return the stored result
+						// (This happens on the second analysis pass for printing)
+						if (current_analysis_pos == it->second.first_seen_pos && !it->second.result.empty())
+							return it->second.result;
+
+						// Different position - generate cross-reference
+						auto poly_name = _poly.get_formatted_name();
+
+						if (it->second.result.empty())
+						{
+							// Being processed by another thread or recursively - return placeholder
+							return fmt::format("({}) See {}", poly_name, it->second.first_seen_label);
+						}
+						else
+						{
+							// Already completed - return cross-reference
+							return fmt::format("{} See {}", poly_name, it->second.first_seen_label);
+						}
+					}
+					// else: we successfully reserved this slot, continue with introspection
+				}
+
+				auto result = _poly.get_formatted_name();
 				F4::filter_results xInfo;
 
 				const auto moduleBase = REL::Module::GetSingleton()->base();
@@ -913,23 +1028,136 @@ namespace Crash::Introspection
 				const std::span bases(
 					reinterpret_cast<std::uint32_t*>(hierarchy->baseClassArray.offset() + moduleBase),
 					hierarchy->numBaseClasses);
-				for (const auto rva : bases) {
+				for (const auto rva : bases)
+				{
 					const auto base = reinterpret_cast<RE::RTTI::BaseClassDescriptor*>(rva + moduleBase);
 					const auto it = FILTERS.find(base->typeDescriptor->raw_name());
-					if (it != FILTERS.end()) {
+					if (it != FILTERS.end())
+					{
 						const auto root = REX::ADJUST_POINTER<void>(_ptr, -static_cast<std::ptrdiff_t>(_col->offset));
 						const auto target = REX::ADJUST_POINTER<void>(root, static_cast<std::ptrdiff_t>(base->pmd.mDisp));
 						it->second(xInfo, target, 0);
 					}
-					REX::INFO("Found unhandled type:\t{}\t{}"sv, result, base->typeDescriptor->raw_name());
+					else
+					{
+						// Demangle the type name for better readability using the improved PDB demangler
+						const char* mangled_name = base->typeDescriptor->raw_name();
+						if (mangled_name && mangled_name[0] != '\0') {
+							std::string demangled_info = Crash::PDB::demangle(std::string(mangled_name));
+							REX::INFO("Found unhandled type:\t{}\t{} [{}]"sv, result, mangled_name, demangled_info);
+						}
+						else
+							REX::INFO("Found unhandled type:\t{}\t<null>"sv, result);
+					}
 				}
 
-				if (!xInfo.empty()) {
-					for (const auto& [key, value] : xInfo) {
-						result += fmt::format(
-							"\n\t\t{}: {}"sv,
-							key,
-							value);
+				// Post-process filters to reduce verbosity and improve header
+				std::string rootFile, rootName, rootFormID, rootFormType, rootFlags;
+				std::size_t rootFileIdx = std::string::npos, rootNameIdx = std::string::npos,
+					rootFormIDIdx = std::string::npos, rootFormTypeIdx = std::string::npos, rootFlagsIdx = std::string::npos;
+
+				for (std::size_t i = 0; i < xInfo.size(); ++i)
+				{
+					const auto& key = xInfo[i].first;
+					const auto& val = xInfo[i].second;
+					// Only match root-level keys (no leading tabs) to avoid matching nested "Full Name", "Skeleton Name", etc.
+					if (key == "File")
+					{
+						rootFile = val;
+						rootFileIdx = i;
+					}
+					else if (key == "Name")
+					{
+						rootName = val;
+						rootNameIdx = i;
+					}
+					else if (key == "FormID")
+					{
+						rootFormID = val;
+						rootFormIDIdx = i;
+					}
+					else if (key == "FormType")
+					{
+						rootFormType = val;
+						rootFormTypeIdx = i;
+					}
+					else if (key == "Flags")
+					{
+						rootFlags = val;
+						rootFlagsIdx = i;
+					}
+				}
+
+				// Append to header
+				if (!rootName.empty())
+					result += fmt::format(" {}"sv, rootName);
+				if (!rootFormID.empty())
+					result += fmt::format(" [{}]"sv, rootFormID);
+				if (!rootFile.empty())
+					result += fmt::format(" ({})"sv, rootFile);
+
+				// Mark for removal
+				std::vector<bool> remove(xInfo.size(), false);
+				if (rootFileIdx != std::string::npos)
+					remove[rootFileIdx] = true;
+				if (rootNameIdx != std::string::npos)
+					remove[rootNameIdx] = true;
+				if (rootFormIDIdx != std::string::npos)
+					remove[rootFormIDIdx] = true;
+				if (rootFormTypeIdx != std::string::npos)
+					remove[rootFormTypeIdx] = true;
+				if (rootFlagsIdx != std::string::npos)
+					remove[rootFlagsIdx] = true;
+
+				// Remove duplicates (nested objects matching root)
+				for (std::size_t i = 0; i < xInfo.size(); ++i) {
+					if (remove[i])
+						continue;
+					const auto& key = xInfo[i].first;
+					const auto& val = xInfo[i].second;
+
+					// Match any depth for duplicate removal (starts with tab or exact match)
+					if ((key == "File" || key.find("\tFile") == 0) && val == rootFile)
+						remove[i] = true;
+					if ((key == "Name" || key.find("\tName") == 0) && val == rootName)
+						remove[i] = true;
+				}
+
+				if (!xInfo.empty())
+				{
+					for (std::size_t i = 0; i < xInfo.size(); ++i)
+					{
+						if (!remove[i])
+						{
+							result += fmt::format(
+								"\n\t\t{}: {}"sv,
+								xInfo[i].first,
+								xInfo[i].second);
+						}
+					}
+				}
+
+				// Check if this is a game-relevant type (filter out STL types)
+				// Extract the type name from result: "(TypeName*)"
+				std::string_view result_view(result);
+				std::size_t start = result_view.find('(');
+				std::size_t end = result_view.find("*)");
+				bool is_game_obj = true;  // Default to true for F4 types
+
+				if (start != std::string_view::npos && end != std::string_view::npos && end > start)
+				{
+					std::string_view type_name = result_view.substr(start + 1, end - start - 1);
+					is_game_obj = is_game_relevant_type(type_name);
+				}
+
+				// Update the reserved slot with the complete result
+				{
+					std::lock_guard<std::mutex> lock(seen_objects_mutex);
+					auto it = seen_objects.find(_ptr);
+					if (it != seen_objects.end())
+					{
+						it->second.result = result;
+						it->second.is_game_object = is_game_obj;
 					}
 				}
 
@@ -937,7 +1165,8 @@ namespace Crash::Introspection
 			}
 
 		private:
-			static constexpr auto FILTERS = frozen::make_map({
+			static constexpr auto FILTERS = frozen::make_map(
+			{
 				std::make_pair(".?AULooseFileStreamBase@?A0xaf4cad8a@BSResource@@"sv, F4::BSResource::LooseFileStreamBase::filter),
 				std::make_pair(".?AVBSShaderProperty@@"sv, F4::BSShaderProperty::filter),
 				std::make_pair(".?AVCodeTasklet@Internal@BSScript@@"sv, F4::CodeTasklet::filter),
@@ -957,7 +1186,7 @@ namespace Crash::Introspection
 				std::make_pair(".?AVTESObjectCELL@@"sv, F4::TESForm<RE::TESObjectCELL>::filter),
 				std::make_pair(".?AVTESObjectREFR@@"sv, F4::TESObjectREFR::filter),
 				std::make_pair(".?AVTESQuest@@"sv, F4::TESQuest::filter),
-				});
+			});
 
 			Polymorphic _poly;
 			const RE::RTTI::CompleteObjectLocator* _col{ nullptr };
@@ -967,10 +1196,7 @@ namespace Crash::Introspection
 		class String
 		{
 		public:
-			String(std::string_view a_str) noexcept :
-				_str(a_str)
-			{
-			}
+			String(std::string_view a_str) noexcept : _str(a_str) {}
 
 			[[nodiscard]] std::string name() const
 			{
@@ -981,16 +1207,33 @@ namespace Crash::Introspection
 			std::string_view _str;
 		};
 
+		class HeapPointer
+		{
+		public:
+			HeapPointer(const void* a_ptr, const Heap::HeapInfo& a_info) noexcept : _ptr(a_ptr), _info(a_info) {}
+
+			[[nodiscard]] std::string name() const
+			{
+				return fmt::format("(void*) 0x{:012X} [Heap: {}]"sv,
+					reinterpret_cast<std::uintptr_t>(_ptr),
+					Heap::format_heap_info(_info));
+			}
+
+		private:
+			const void* _ptr;
+			Heap::HeapInfo _info;
+		};
+
 		using analysis_result = std::variant<
 			Integer,
 			Pointer,
 			Polymorphic,
 			F4Polymorphic,
-			String>;
+			String,
+			HeapPointer>;
 
 		template <class T, class... Args>
-		[[nodiscard]] analysis_result make_result(Args&&... a_args) noexcept(
-			std::is_nothrow_constructible_v<T, Args...>)
+		[[nodiscard]] analysis_result make_result(Args&&... a_args) noexcept(std::is_nothrow_constructible_v<T, Args...>)
 		{
 			return analysis_result(std::in_place_type_t<T>{}, std::forward<Args>(a_args)...);
 		}
@@ -1000,53 +1243,51 @@ namespace Crash::Introspection
 			std::span<const module_pointer> a_modules) noexcept
 			-> std::optional<analysis_result>
 		{
-			try {
+			try
+			{
 				const auto vtable = *reinterpret_cast<void**>(a_ptr);
 				const auto mod = get_module_for_pointer(vtable, a_modules);
-				if (!mod || !mod->in_rdata_range(vtable)) {
+				if (!mod || !mod->in_rdata_range(vtable))
 					return std::nullopt;
-				}
 
 				const auto col =
 					*reinterpret_cast<RE::RTTI::CompleteObjectLocator**>(
 						reinterpret_cast<std::size_t*>(vtable) - 1);
-				if (mod != get_module_for_pointer(col, a_modules) || !mod->in_rdata_range(col)) {
+				if (mod != get_module_for_pointer(col, a_modules) || !mod->in_rdata_range(col))
 					return std::nullopt;
-				}
 
 				const auto typeDesc =
 					reinterpret_cast<RE::RTTI::TypeDescriptor*>(
 						mod->address() + col->typeDescriptor.offset());
-				if (mod != get_module_for_pointer(typeDesc, a_modules) || !mod->in_data_range(typeDesc)) {
+				if (mod != get_module_for_pointer(typeDesc, a_modules) || !mod->in_data_range(typeDesc))
 					return std::nullopt;
-				}
 
-				if (*reinterpret_cast<const void**>(typeDesc) != mod->type_info()) {
+				if (*reinterpret_cast<const void**>(typeDesc) != mod->type_info())
 					return std::nullopt;
-				}
 
-				if (_stricmp(mod->name().data(), util::module_name().c_str()) == 0) {
+				if (_stricmp(mod->name().data(), util::module_name().c_str()) == 0)
 					return make_result<F4Polymorphic>(typeDesc->raw_name(), col, a_ptr);
-				}
-				else {
+				else
 					return make_result<Polymorphic>(typeDesc->raw_name());
-				}
 			}
-			catch (...) {
+			catch (...)
+			{
 				return std::nullopt;
 			}
 		}
 
-		[[nodiscard]] auto analyze_string(void* a_ptr) noexcept
-			-> std::optional<analysis_result>
+		[[nodiscard]] auto analyze_string(void* a_ptr) noexcept -> std::optional<analysis_result>
 		{
-			try {
-				const auto printable = [](char a_ch) noexcept {
-					if (' ' <= a_ch && a_ch <= '~') {
+			try
+			{
+				const auto printable = [](char a_ch) noexcept
+				{
+					if (' ' <= a_ch && a_ch <= '~')
 						return true;
-					}
-					else {
-						switch (a_ch) {
+					else
+					{
+						switch (a_ch)
+						{
 						case '\t':
 						case '\n':
 							return true;
@@ -1054,24 +1295,24 @@ namespace Crash::Introspection
 							return false;
 						}
 					}
-					};
+				};
 
 				const auto str = static_cast<const char*>(a_ptr);
 				constexpr std::size_t max = 1000;
 				std::size_t len = 0;
-				for (; len < max && str[len] != '\0'; ++len) {
-					if (!printable(str[len])) {
+				for (; len < max && str[len] != '\0'; ++len)
+				{
+					if (!printable(str[len]))
 						return std::nullopt;
-					}
 				}
 
-				if (len == 0 || len >= max) {
+				if (len == 0 || len >= max)
 					return std::nullopt;
-				}
 
 				return make_result<String>(std::string_view{ str, len });
 			}
-			catch (...) {
+			catch (...)
+			{
 				return std::nullopt;
 			}
 		}
@@ -1081,12 +1322,23 @@ namespace Crash::Introspection
 			std::span<const module_pointer> a_modules) noexcept
 			-> analysis_result
 		{
-			if (auto poly = analyze_polymorphic(a_ptr, a_modules); poly) {
+			if (auto poly = analyze_polymorphic(a_ptr, a_modules); poly)
 				return *std::move(poly);
-			}
 
-			if (auto str = analyze_string(a_ptr); str) {
+			if (auto str = analyze_string(a_ptr); str)
 				return *std::move(str);
+
+			// Check if pointer is in a heap allocation
+			// Wrap in try-catch since analyze_heap_pointer can throw (e.g., OOM during crash)
+			try
+			{
+				if (auto heap_info = Heap::analyze_heap_pointer(a_ptr); heap_info)
+					return make_result<HeapPointer>(a_ptr, *heap_info);
+			}
+			catch (...)
+			{
+				// Swallow exception and fall back to basic pointer analysis
+				// (better to lose heap metadata than the entire crash log)
 			}
 
 			return make_result<Pointer>(a_ptr, a_modules);
@@ -1109,23 +1361,75 @@ namespace Crash::Introspection
 		}
 	}
 
+	void reset_analysis_state() noexcept
+	{
+		std::lock_guard<std::mutex> lock(detail::seen_objects_mutex);
+		detail::seen_objects.clear();
+		detail::backfill_logged_this_crash = false;
+		detail::total_backfill_count = 0;
+	}
+
 	std::vector<std::string> analyze_data(
 		std::span<const std::size_t> a_data,
-		std::span<const module_pointer> a_modules)
+		std::span<const module_pointer> a_modules,
+		std::function<std::string(size_t)> a_label_generator)
 	{
+		detail::label_generator = a_label_generator;
 		std::vector<std::string> results;
 		results.resize(a_data.size());
 		std::for_each(
 			std::execution::par_unseq,
 			a_data.begin(),
 			a_data.end(),
-			[&](auto& a_val) {
-				const auto result = detail::analyze_integer(a_val, a_modules);
+			[&](auto& a_val)
+			{
 				const auto pos = std::addressof(a_val) - a_data.data();
+				detail::current_analysis_pos = static_cast<std::size_t>(pos);
+				const auto result = detail::analyze_integer(a_val, a_modules);
 				results[pos] = std::visit(
 					[](const auto& a_analysis) { return a_analysis.name(); },
 					result);
 			});
 		return results;
 	}
+}
+
+void Crash::Introspection::backfill_void_pointers(std::vector<std::string>& a_results, std::span<const std::size_t> a_addresses)
+{
+	assert(a_results.size() == a_addresses.size());
+
+	for (std::size_t i = 0; i < a_results.size(); ++i)
+	{
+		auto& result = a_results[i];
+		std::size_t addr = a_addresses[i];
+
+		// Only process entries that are still void* pointers (not already replaced)
+		if (result.starts_with("(void*"))
+		{
+			// Check if this address points to a known object
+			auto it = detail::seen_objects.find(reinterpret_cast<const void*>(addr));
+			if (it != detail::seen_objects.end())
+			{
+				// Replace with full object information
+				result = it->second.result;
+				++detail::total_backfill_count;
+			}
+		}
+	}
+
+	// Log the backfill statistics (only once per crash)
+	if (!detail::backfill_logged_this_crash && detail::total_backfill_count > 0)
+	{
+		REX::INFO("Backfilled {} void* pointers with known object information across all analysis", detail::total_backfill_count);
+		detail::backfill_logged_this_crash = true;
+	}
+}
+
+bool Crash::Introspection::was_introspected(const void* a_ptr) noexcept
+{
+	// Return true ONLY if the object is a game object (polymorphic type)
+	// Exclude void* pointers with module info (those are not game objects)
+	std::lock_guard<std::mutex> lock(detail::seen_objects_mutex);
+	auto it = detail::seen_objects.find(a_ptr);
+	return it != detail::seen_objects.end() && it->second.is_game_object;
 }

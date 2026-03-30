@@ -12,7 +12,7 @@ set_license("GPL-3.0")
 local name = "AddictolCrashLogger"
 
 -- project version
-local version = "1.0.0"
+local version = "1.2.0"
 local major, minor, patch = version:match("^(%d+)%.(%d+)%.(%d+)$")
 set_version(version)
 
@@ -23,6 +23,7 @@ set_warnings("allextra")
 
 -- set policies
 set_policy("package.requires_lock", true)
+set_policy("build.optimization.lto", true)
 
 -- add rules
 add_rules("mode.release", "mode.releasedbg", "mode.debug")
@@ -33,6 +34,12 @@ set_config("commonlib_ini", true)
 set_config("commonlib_xbyak", true)
 
 -- add requires
+add_requires("boost", {
+    configs = {
+        stacktrace = true
+    }
+})
+add_requires("directxtk")
 add_requires("fmt")
 add_requires("frozen")
 add_requires("infoware", {
@@ -40,36 +47,42 @@ add_requires("infoware", {
         d3d = true
     }
 })
-add_requires("magic_enum 0.8.2")
-add_requires("zydis 3.2.1")
-add_requires("boost 1.86.0", {
-    configs = {
-        container  = true,
-        nowide     = true,
-        stacktrace = true,
-        system     = true
-    }
-})
+add_requires("magic_enum")
+add_requires("rapidcsv")
+add_requires("rsm-binary-io")
+add_requires("zydis")
 
 -- override runtime count
 add_defines("COMMONLIB_RUNTIMECOUNT=3")
 
 -- targets
 target("AddictolCrashLogger")
-    add_cxxflags("/EHa", "/permissive-", { public = true })
+    add_cxxflags("/permissive-", "/EHa", "/Zc:preprocessor", { public = true })
 
     -- add packages
+    add_packages("boost")
+    add_packages("directxtk")
     add_packages("fmt")
     add_packages("frozen")
     add_packages("infoware")
     add_packages("magic_enum")
+    add_packages("rapidcsv")
+    add_packages("rsm-binary-io")
     add_packages("zydis")
-    add_packages("boost")
 
     -- add DIA SDK Includes
     add_includedirs(os.getenv("VSINSTALLDIR") .. "/DIA SDK/include")
     add_linkdirs(os.getenv("VSINSTALLDIR") .. "/DIA SDK/lib/amd64")
     add_links("diaguids", "ole32", "uuid")
+
+    -- add dbghelp
+    add_links("dbghelp")
+
+    -- add winhttp
+    add_links("winhttp")
+
+    -- add vmaware
+    add_includedirs("lib/vmaware/src")
 
     -- add dependencies to target
     add_deps("commonlibf4")

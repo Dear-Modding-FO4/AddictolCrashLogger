@@ -1,66 +1,26 @@
 ﻿#include "CrashHandler.h"
 
+#include "Analysis/Analysis.h"
+#include "CommonHeader/CommonHeader.h"
+#include "CppException/CppException.h"
 #include "Introspection/Introspection.h"
+#include "Introspection/RelevantObjectsSimplifier.h"
 #include "Modules/ModuleHandler.h"
 #include "PDB/PdbHandler.h"
-
-#define NOGDICAPMASKS
-#define NOVIRTUALKEYCODES
-#define NOWINMESSAGES
-#define NOWINSTYLES
-#define NOSYSMETRICS
-#define NOMENUS
-#define NOICONS
-#define NOKEYSTATES
-#define NOSYSCOMMANDS
-#define NORASTEROPS
-#define NOSHOWWINDOW
-#define OEMRESOURCE
-#define NOATOM
-#define NOCLIPBOARD
-#define NOCOLOR
-#define NOCTLMGR
-#define NODRAWTEXT
-#define NOGDI
-#define NOKERNEL
-#define NOUSER
-#define NONLS
-#define NOMB
-#define NOMEMMGR
-#define NOMETAFILE
-#define NOMSG
-#define NOOPENFILE
-#define NOSCROLL
-#define NOSERVICE
-#define NOSOUND
-#define NOTEXTMETRIC
-#define NOWH
-#define NOWINOFFSETS
-#define NOCOMM
-#define NOKANJI
-#define NOHELP
-#define NOPROFILER
-#define NODEFERWINDOWPOS
-#define NOMCX
-
-#include <Windows.h>
-#include <winternl.h>
-
-#undef max
-#undef min
+#include "ThreadDump/ThreadDump.h"
+#include "dxgi1_4.h"
+#include <Zydis/Zydis.h>
+#include <vmaware.hpp>
+#include <wincrypt.h>
 
 namespace Crash
 {
-	// Config Options
-	static REX::INI::Bool bWaitForDebugger{ "CrashLogger"sv, "bWaitForDebugger"sv, false };
-	static REX::INI::Bool bBotCompatibilityMode{ "CrashLogger"sv, "bBotCompatibilityMode"sv, true };
+	std::filesystem::path crashPath;
 
 	class SEHException : public std::exception
 	{
 	public:
-		SEHException(const std::string& message, DWORD code) :
-			_message(message), _code(code) {
-		}
+		SEHException(const std::string& message, DWORD code) : _message(message), _code(code) {}
 
 		const char* what() const noexcept override
 		{
@@ -77,29 +37,184 @@ namespace Crash
 		DWORD _code;
 	};
 
-	// SEH to C++ exception translator function
 	void seh_translator(unsigned int code, EXCEPTION_POINTERS*)
 	{
 		throw SEHException("SEH Exception occurred", code);
 	}
 
+	std::pair<boost::stacktrace::stacktrace, bool> safe_capture_stacktrace() noexcept
+	{
+		try
+		{
+			// Capture with limited depth to avoid excessive memory usage
+			// If this crashes during stack unwinding, the catch will handle it
+			auto st = boost::stacktrace::stacktrace(0, 500);
+			return { std::move(st), true };
+		}
+		catch (const std::bad_alloc&)
+		{
+			// Out of memory during stack capture - stack may be corrupted
+			return { boost::stacktrace::stacktrace(0, 0), false };
+		}
+		catch (...)
+		{
+			// Exception during stacktrace capture - stack is likely corrupted
+			return { boost::stacktrace::stacktrace(0, 0), false };
+		}
+	}
+
 	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except)
 	{
-		const auto exceptionAddress = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
-		auto it = std::find_if(_stacktrace.cbegin(), _stacktrace.cend(), [&](auto&& a_elem) noexcept {
-			return reinterpret_cast<std::uintptr_t>(a_elem.address()) == exceptionAddress;
+		auto [stacktrace, success] = safe_capture_stacktrace();
+		_stacktrace = std::move(stacktrace);
+
+		try
+		{
+			if (_stacktrace.empty())
+			{
+				_frames = std::span<const boost::stacktrace::frame>();
+				return;
+			}
+
+			if (_stacktrace.size() > 10000)
+			{
+				// Truncate extremely large stack traces
+				_frames = std::span(_stacktrace.begin(), _stacktrace.begin() + 1000);
+				return;
+			}
+
+			const auto exceptionAddress = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
+			auto it = std::find_if(_stacktrace.cbegin(), _stacktrace.cend(), [&](auto&& a_elem) noexcept
+			{
+				try
+				{
+					return reinterpret_cast<std::uintptr_t>(a_elem.address()) == exceptionAddress;
+				}
+				catch (...)
+				{
+					// Invalid frame, skip
+					return false;
+				}
 			});
 
-		if (it == _stacktrace.cend()) {
-			it = _stacktrace.cbegin();
-		}
+			if (it == _stacktrace.cend())
+				it = _stacktrace.cbegin();
 
-		_frames = std::span(it, _stacktrace.cend());
+			_frames = std::span(it, _stacktrace.cend());
+		}
+		catch (...)
+		{
+			// Fallback: create minimal safe frame span
+			if (!_stacktrace.empty())
+				_frames = std::span(_stacktrace.begin(), _stacktrace.begin() + 1);
+			else
+				_frames = std::span<const boost::stacktrace::frame>();
+		}
 	}
 
 	void Callstack::print(spdlog::logger& a_log, std::span<const module_pointer> a_modules) const
 	{
 		print_probable_callstack(a_log, a_modules);
+	}
+
+	std::string Callstack::get_throw_location(std::span<const module_pointer> a_modules) const
+	{
+		// For C++ exceptions, the throw site is typically:
+		// frame[0] = KERNELBASE.dll (RaiseException)
+		// frame[1] = VCRUNTIME140.dll (_CxxThrowException)
+		// frame[2] = actual throw site (or ThrowIfFailed wrapper)
+		// We scan for the first non-system frame
+
+		if (_frames.size() < 3)
+			return "";
+
+		try
+		{
+			for (std::size_t i = 0; i < std::min(_frames.size(), std::size_t(10)); ++i)
+			{
+				const auto& frame = _frames[i];
+				const auto addr = frame.address();
+				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
+
+				if (mod)
+				{
+					const auto modName = mod->name();
+					// Skip system frames
+					if (modName.find("KERNELBASE") != std::string::npos ||
+						modName.find("VCRUNTIME") != std::string::npos ||
+						modName.find("ntdll") != std::string::npos ||
+						modName.find("KERNEL32") != std::string::npos ||
+						modName.find("ucrtbase") != std::string::npos)
+					{
+						continue;
+					}
+
+					// Found the throw site - get detailed info
+					const auto frameAddr = reinterpret_cast<std::uintptr_t>(addr);
+					const auto pdbDetails = Crash::PDB::pdb_details(mod->path(), frameAddr - mod->address());
+
+					if (!pdbDetails.empty())
+						return pdbDetails;
+					else
+						// No PDB, return module+offset
+						return fmt::format("{}+{:07X}", mod->name(), frameAddr - mod->address());
+				}
+			}
+		}
+		catch (...)
+		{
+			// Ignore errors
+		}
+
+		return "";
+	}
+
+	std::vector<std::string> Callstack::get_frame_info_strings(std::span<const module_pointer> a_modules, std::size_t a_max_frames) const
+	{
+		std::vector<std::string> results;
+		const auto frame_count = std::min(_frames.size(), a_max_frames);
+		results.reserve(frame_count);
+
+		for (std::size_t i = 0; i < frame_count; ++i)
+		{
+			try
+			{
+				const auto& frame = _frames[i];
+				const auto addr = frame.address();
+				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
+				if (mod)
+					results.push_back(fmt::format("{}{}", mod->name(), mod->frame_info(frame)));
+				else
+					results.push_back("<unknown>");
+			}
+			catch (...)
+			{
+				results.push_back("<frame error>");
+			}
+		}
+
+		return results;
+	}
+
+	std::vector<const void*> Callstack::get_frame_addresses(std::size_t a_max_frames) const
+	{
+		std::vector<const void*> results;
+		const auto frame_count = std::min(_frames.size(), a_max_frames);
+		results.reserve(frame_count);
+
+		for (std::size_t i = 0; i < frame_count; ++i)
+		{
+			try
+			{
+				results.push_back(_frames[i].address());
+			}
+			catch (...)
+			{
+				results.push_back(nullptr);
+			}
+		}
+
+		return results;
 	}
 
 	std::string Callstack::get_size_string(std::size_t a_size)
@@ -116,36 +231,55 @@ namespace Crash
 	{
 		a_log.critical("PROBABLE CALL STACK:"sv);
 
-		std::vector<const Modules::Module*> moduleStack;
-		moduleStack.reserve(_frames.size());
-		for (const auto& frame : _frames) {
-			const auto mod = Introspection::get_module_for_pointer(frame.address(), a_modules);
-			if (mod && mod->in_range(frame.address())) {
-				moduleStack.push_back(mod);
+		// Handle empty stacktrace case (indicates capture failure due to stack corruption)
+		if (_frames.empty()) {
+			a_log.critical("WARNING: Stack trace capture failed - the call stack was likely corrupted.");
+			a_log.critical("         The crash information below may be incomplete or unavailable.");
+			a_log.critical("         Unable to retrieve any stack frames due to stack corruption.");
+			return;
+		}
+
+		// Limit stack frames to prevent excessive memory usage and processing time
+		constexpr std::size_t MAX_FRAMES = 500;
+		const auto frame_count = std::min(_frames.size(), MAX_FRAMES);
+		if (_frames.size() > MAX_FRAMES)
+			a_log.critical("Stack trace truncated to {} frames (original: {})", MAX_FRAMES, _frames.size());
+
+		// Build frame data using shared DRY code
+		std::vector<FrameData> frame_data;
+		frame_data.reserve(frame_count);
+
+		for (std::size_t i = 0; i < frame_count; ++i)
+		{
+			try
+			{
+				const auto& frame = _frames[i];
+				const auto addr = frame.address();
+				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
+
+				const auto frame_info = mod ? [&]()
+				{
+					try
+					{
+						return mod->frame_info(frame);
+					}
+					catch (...)
+					{
+						return std::string("[frame info error]");
+					}
+				}() : ""s;
+
+				frame_data.push_back({ addr, mod, frame_info });
 			}
-			else {
-				moduleStack.push_back(nullptr);
+			catch (...)
+			{
+				// Invalid frame, add placeholder
+				frame_data.push_back({ nullptr, nullptr, "[frame processing failed]"s });
 			}
 		}
 
-		const auto format = get_format([&]() {
-			std::size_t max = 0;
-			std::for_each(moduleStack.begin(), moduleStack.end(),
-				[&](auto&& a_elem) { max = a_elem ? std::max(max, a_elem->name().length()) : max; });
-			return max;
-			}());
-
-		for (std::size_t i = 0; i < _frames.size(); ++i) {
-			const auto mod = moduleStack[i];
-			const auto& frame = _frames[i];
-			a_log.critical(fmt::format(
-				fmt::runtime(format),
-				i,
-				reinterpret_cast<std::uintptr_t>(frame.address()),
-				mod ? mod->name() : "",
-				mod ? mod->frame_info(frame) : ""
-			));
-		}
+		// Use shared printing logic (DRY)
+		print_callstack_impl(a_log, frame_data, "\t"sv);
 	}
 
 	void Callstack::print_raw_callstack(spdlog::logger& a_log) const
@@ -154,16 +288,13 @@ namespace Crash
 
 		const auto format = "\t[{:>"s + get_size_string(_stacktrace.size()) + "}] 0x{:X}"s;
 
-		for (std::size_t i = 0; i < _stacktrace.size(); ++i) {
-			a_log.critical(fmt::format(
-				fmt::runtime(format),
-				i,
-				reinterpret_cast<std::uintptr_t>(_stacktrace[i].address())
-			));
+		for (std::size_t i = 0; i < _stacktrace.size(); ++i)
+		{
+			a_log.critical(fmt::format(fmt::runtime(format), i, reinterpret_cast<std::uintptr_t>(_stacktrace[i].address())));
 		}
 	}
 
-	std::filesystem::path GetLogDirectory()
+	std::filesystem::path GetF4SELogDirectory()
 	{
 		auto logger = spdlog::default_logger();
 		if (!logger)
@@ -182,45 +313,319 @@ namespace Crash
 
 	namespace
 	{
-		[[nodiscard]] std::shared_ptr<spdlog::logger> get_log()
+		// Structure to hold information about a relevant game object found during crash analysis
+		struct RelevantObject
 		{
-			std::optional<std::filesystem::path> path = GetLogDirectory();
-			if (!path) {
-				REX::FAIL("failed to find standard log directory"sv);
+			std::size_t address;
+			std::string full_analysis;  // Full introspection output
+			std::string location;       // Register name or stack offset
+			std::size_t distance;       // Lower = closer to exception (0 = in registers, 1+ = stack offset)
+		};
+
+		// Collection to store interesting objects found during analysis
+		struct RelevantObjectsCollection
+		{
+			std::map<std::size_t, RelevantObject> objects;
+
+			void add(std::size_t address, std::string full_analysis, std::string location, std::size_t distance)
+			{
+				if (address == 0)
+					return;
+
+				// Check if this address has game introspection data
+				// FormIDs are always considered relevant as they imply successful introspection
+				const bool is_form_id = full_analysis.starts_with("(FormID");
+				if (!is_form_id && !Introspection::was_introspected(reinterpret_cast<const void*>(address)))
+					return;
+
+				// Skip cross-references ("See RSP+XX") - we only want the first full occurrence
+				if (full_analysis.find(" See ") != std::string::npos)
+					return;
+
+				// Keep the closest occurrence (smallest distance) for each unique address
+				auto it = objects.find(address);
+				if (it == objects.end())
+				{
+					// First time seeing this address
+					objects[address] = { address, std::move(full_analysis), std::move(location), distance };
+				}
+				else if (distance < it->second.distance)
+				{
+					// Found a closer occurrence, replace it
+					it->second = { address, std::move(full_analysis), std::move(location), distance };
+				}
+				// Otherwise, keep the existing closer occurrence
 			}
 
-			const auto time = std::time(nullptr);
-			std::tm localTime{};
-			if (gmtime_s(&localTime, &time) != 0) {
-				REX::FAIL("failed to get current time"sv);
+			std::vector<RelevantObject> get_sorted() const
+			{
+				std::vector<RelevantObject> sorted;
+				sorted.reserve(objects.size());
+				for (const auto& [addr, obj] : objects)
+				{
+					sorted.push_back(obj);
+				}
+				std::sort(sorted.begin(), sorted.end(), [](const RelevantObject& a, const RelevantObject& b)
+				{
+					return a.distance < b.distance;
+				});
+				return sorted;
 			}
+		};
 
-			std::stringstream buf;
-			buf << "crash-"sv << std::put_time(&localTime, "%Y-%m-%d-%H-%M-%S") << ".log"sv;
-			*path /= buf.str();
+		// Structure to buffer section output for reordering
+		struct SectionBuffer
+		{
+			std::string name;
+			std::stringstream content;
 
-			auto sink = std::make_shared<spdlog::sinks::basic_file_sink_st>(path->string(), true);
-			auto log = std::make_shared<spdlog::logger>("crash log"s, std::move(sink));
-			log->set_pattern("%v"s);
-			log->set_level(spdlog::level::trace);
-			log->flush_on(spdlog::level::off);
+			SectionBuffer(std::string section_name) : name(std::move(section_name)) {}
+		};
 
-			return log;
+		[[nodiscard]] std::string get_file_md5(const std::filesystem::path& filepath)
+		{
+			const auto get_error_message = [](DWORD error) -> std::string
+			{
+				if (error == 0)
+					return "No error";
+
+				LPSTR messageBuffer = nullptr;
+				const auto size = FormatMessageA(
+					FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+					nullptr, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+					reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
+
+				if (size == 0) {
+					return fmt::format("Error {:#x}", error);
+				}
+
+				std::string message(messageBuffer, size);
+				LocalFree(messageBuffer);
+
+				// Remove trailing newlines
+				while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
+				{
+					message.pop_back();
+				}
+
+				return fmt::format("Error {:#x}: {}", error, message);
+			};
+
+			try
+			{
+				std::ifstream file(filepath, std::ios::binary);
+				if (!file)
+				{
+					const auto error = GetLastError();
+					return fmt::format("<file not accessible - {}>", get_error_message(error));
+				}
+
+				HCRYPTPROV hProv = 0;
+				HCRYPTHASH hHash = 0;
+
+				if (!CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+				{
+					const auto error = GetLastError();
+					return fmt::format("<CryptAcquireContext failed - {}>", get_error_message(error));
+				}
+
+				if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash))
+				{
+					const auto error = GetLastError();
+					CryptReleaseContext(hProv, 0);
+					return fmt::format("<CryptCreateHash failed - {}>", get_error_message(error));
+				}
+
+				constexpr size_t BUFSIZE = 8192;
+				char buffer[BUFSIZE];
+				while (file.read(buffer, BUFSIZE) || file.gcount() > 0)
+				{
+					if (!CryptHashData(hHash, reinterpret_cast<BYTE*>(buffer),
+						static_cast<DWORD>(file.gcount()), 0))
+					{
+						const auto error = GetLastError();
+						CryptDestroyHash(hHash);
+						CryptReleaseContext(hProv, 0);
+						return fmt::format("<CryptHashData failed - {}>", get_error_message(error));
+					}
+				}
+
+				DWORD dwHashLen = 16;  // MD5 is always 16 bytes
+				BYTE hash[16];
+				if (!CryptGetHashParam(hHash, HP_HASHVAL, hash, &dwHashLen, 0))
+				{
+					const auto error = GetLastError();
+					CryptDestroyHash(hHash);
+					CryptReleaseContext(hProv, 0);
+					return fmt::format("<CryptGetHashParam failed - {}>", get_error_message(error));
+				}
+
+				CryptDestroyHash(hHash);
+				CryptReleaseContext(hProv, 0);
+
+				std::stringstream ss;
+				ss << std::hex << std::setfill('0');
+				for (int i = 0; i < 16; ++i)
+				{
+					ss << std::setw(2) << static_cast<unsigned>(hash[i]);
+				}
+				return ss.str();
+			}
+			catch (const std::exception& e)
+			{
+				return fmt::format("<exception: {}>", e.what());
+			}
+			catch (...)
+			{
+				return "<unknown exception>";
+			}
 		}
 
-		void print_exception(spdlog::logger& a_log, const ::EXCEPTION_RECORD& a_exception,
-			std::span<const module_pointer> a_modules)
+		std::optional<std::size_t> get_register_value(const ::CONTEXT& a_context, ZydisRegister reg)
+		{
+			const auto fullReg = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+			switch (fullReg)
+			{
+			case ZYDIS_REGISTER_RAX:
+				return a_context.Rax;
+			case ZYDIS_REGISTER_RBX:
+				return a_context.Rbx;
+			case ZYDIS_REGISTER_RCX:
+				return a_context.Rcx;
+			case ZYDIS_REGISTER_RDX:
+				return a_context.Rdx;
+			case ZYDIS_REGISTER_RSI:
+				return a_context.Rsi;
+			case ZYDIS_REGISTER_RDI:
+				return a_context.Rdi;
+			case ZYDIS_REGISTER_RBP:
+				return a_context.Rbp;
+			case ZYDIS_REGISTER_RSP:
+				return a_context.Rsp;
+			case ZYDIS_REGISTER_R8:
+				return a_context.R8;
+			case ZYDIS_REGISTER_R9:
+				return a_context.R9;
+			case ZYDIS_REGISTER_R10:
+				return a_context.R10;
+			case ZYDIS_REGISTER_R11:
+				return a_context.R11;
+			case ZYDIS_REGISTER_R12:
+				return a_context.R12;
+			case ZYDIS_REGISTER_R13:
+				return a_context.R13;
+			case ZYDIS_REGISTER_R14:
+				return a_context.R14;
+			case ZYDIS_REGISTER_R15:
+				return a_context.R15;
+			default:
+				return std::nullopt;
+			}
+		}
+
+		void print_access_violation_analysis(
+			spdlog::logger& a_log,
+			const ::EXCEPTION_RECORD& a_exception,
+			const ::CONTEXT& a_context)
+		{
+			const auto ip = a_exception.ExceptionAddress;
+			ZydisDisassembledInstruction instruction{};
+
+			// Guard against reading invalid memory at ExceptionAddress
+			// If IP itself is corrupt, ZydisDisassembleIntel could trigger secondary AV
+			__try
+			{
+				if (!ZYAN_SUCCESS(ZydisDisassembleIntel(
+					/* machine_mode:    */ ZYDIS_MACHINE_MODE_LONG_64,
+					/* runtime_address: */ reinterpret_cast<ZyanU64>(ip),
+					/* buffer:          */ reinterpret_cast<const ZyanU8*>(ip),
+					/* length:          */ 16,
+					/* instruction:     */ &instruction)))
+				{
+					return;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				// Failed to read instruction bytes; IP likely points to unmapped/protected memory
+				a_log.critical("ACCESS VIOLATION ANALYSIS: Unable to disassemble instruction at 0x{:016X} (memory not readable)"sv,
+					reinterpret_cast<std::uintptr_t>(ip));
+				return;
+			}
+
+			a_log.critical("ACCESS VIOLATION ANALYSIS:"sv);
+			a_log.critical("\tInstruction: {}"sv, instruction.text);
+
+			for (std::size_t i = 0; i < instruction.info.operand_count; ++i)
+			{
+				const auto& operand = instruction.operands[i];
+				if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY)
+					continue;
+
+				const auto baseValue = get_register_value(a_context, operand.mem.base);
+				const auto indexValue = get_register_value(a_context, operand.mem.index);
+				const auto scale = operand.mem.scale;
+				auto displacement = static_cast<std::int64_t>(operand.mem.disp.value);
+
+				std::optional<std::uint64_t> effectiveAddress;
+				if (baseValue)
+				{
+					// Use signed arithmetic to handle negative displacements correctly
+					effectiveAddress = static_cast<std::uint64_t>(static_cast<std::intptr_t>(*baseValue) + displacement);
+					if (indexValue && scale > 0)
+						effectiveAddress = *effectiveAddress + (*indexValue * scale);
+				}
+
+				const auto baseName = ZydisRegisterGetString(operand.mem.base);
+				const auto indexName = ZydisRegisterGetString(operand.mem.index);
+				a_log.critical("\tMemory Operand: [base={}, index={}, scale={}, disp={:+#x}]"sv,
+					baseName ? baseName : "<none>"sv,
+					indexName ? indexName : "<none>"sv,
+					scale,
+					displacement);
+
+				if (baseValue)
+				{
+					const bool suspicious = (*baseValue == 0) || (*baseValue == std::numeric_limits<std::size_t>::max()) || (*baseValue < 0x10000);
+					a_log.critical("\tBase Register: {} = 0x{:016X}{}"sv,
+						baseName ? baseName : "<none>"sv,
+						*baseValue,
+						suspicious ? " (likely invalid)"sv : ""sv);
+				}
+				if (indexValue)
+				{
+					a_log.critical("\tIndex Register: {} = 0x{:016X}"sv,
+						indexName ? indexName : "<none>"sv,
+						*indexValue);
+				}
+
+				if (effectiveAddress)
+				{
+					a_log.critical("\tComputed Address: 0x{:016X}"sv, *effectiveAddress);
+					if (a_exception.ExceptionInformation[1] != 0 && *effectiveAddress != a_exception.ExceptionInformation[1])
+						a_log.critical("\tFault Address:   0x{:016X} (mismatch)"sv, a_exception.ExceptionInformation[1]);
+				}
+				break;
+			}
+		}
+
+		void print_exception(spdlog::logger& a_log, const ::EXCEPTION_RECORD& a_exception, std::span<const module_pointer> a_modules, const std::string& a_throwLocation = "", const ::CONTEXT* a_context = nullptr)
 		{
 #define EXCEPTION_CASE(a_code) \
 	case a_code:               \
 		return " \"" #a_code "\""sv
 
+			// For C++ exceptions, the ExceptionAddress points to RaiseException in KERNELBASE.dll
+			// The actual throw site is in Parameter[3] (module base)
+			// We'll display both for clarity
 			const auto eptr = a_exception.ExceptionAddress;
 			const auto eaddr = reinterpret_cast<std::uintptr_t>(a_exception.ExceptionAddress);
 
-			const auto post = [&]() {
+			const auto post = [&]()
+				{
 				const auto mod = Introspection::get_module_for_pointer(eptr, a_modules);
-				if (mod) {
+				if (mod)
+				{
 					const auto pdbDetails = Crash::PDB::pdb_details(mod->path(), eaddr - mod->address());
 					const auto assembly = mod->assembly((const void*)eaddr);
 					if (!pdbDetails.empty())
@@ -232,13 +637,14 @@ namespace Crash
 							pdbDetails);
 					return fmt::format(" {}+{:07X}\t{}"sv, mod->name(), eaddr - mod->address(), assembly);
 				}
-				else {
+				else
 					return ""s;
-				}
 				}();
 
-			const auto exception = [&]() {
-				switch (a_exception.ExceptionCode) {
+			const auto exception = [&]()
+			{
+				switch (a_exception.ExceptionCode)
+				{
 					EXCEPTION_CASE(EXCEPTION_ACCESS_VIOLATION);
 					EXCEPTION_CASE(EXCEPTION_ARRAY_BOUNDS_EXCEEDED);
 					EXCEPTION_CASE(EXCEPTION_BREAKPOINT);
@@ -259,49 +665,172 @@ namespace Crash
 					EXCEPTION_CASE(EXCEPTION_PRIV_INSTRUCTION);
 					EXCEPTION_CASE(EXCEPTION_SINGLE_STEP);
 					EXCEPTION_CASE(EXCEPTION_STACK_OVERFLOW);
+				case CPP_EXCEPTION_CODE:
+					return " \"C++ Exception\""sv;
 				default:
 					return ""sv;
 				}
-				}();
+			}();
 
 			a_log.critical("Unhandled exception{} at 0x{:012X}{}"sv, exception, eaddr, post);
 
-			// Log exception flags
-			a_log.critical("Exception Flags: 0x{:08X}"sv, a_exception.ExceptionFlags);
+			// Log exception flags with description
+			a_log.critical("Exception Flags: 0x{:08X}{}"sv, a_exception.ExceptionFlags,
+				(a_exception.ExceptionFlags & EXCEPTION_NONCONTINUABLE) ? " (Non-continuable)" :
+				(a_exception.ExceptionFlags == 0)						? " (Continuable)" :
+																		  "");
 
 			// Log number of parameters
 			a_log.critical("Number of Parameters: {}"sv, a_exception.NumberParameters);
 
+			// Add thread context info
+			const auto tid = GetCurrentThreadId();
+			a_log.critical("Exception Thread ID: {}"sv, tid);
+
 			// Log additional exception information for specific exception types
 			if (a_exception.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
 				const auto accessType = a_exception.ExceptionInformation[0] == 0 ? "read" :
-					a_exception.ExceptionInformation[0] == 1 ? "write" :
-					a_exception.ExceptionInformation[0] == 8 ? "execute" :
-					"unknown";
+										a_exception.ExceptionInformation[0] == 1 ? "write" :
+										a_exception.ExceptionInformation[0] == 8 ? "execute" :
+																				   "unknown";
 				const auto faultAddress = a_exception.ExceptionInformation[1];
 				a_log.critical("Access Violation: Tried to {} memory at 0x{:012X}"sv, accessType, faultAddress);
+				if (a_context)
+					print_access_violation_analysis(a_log, a_exception, *a_context);
 			}
-			else if (a_exception.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
+			else if (a_exception.ExceptionCode == EXCEPTION_IN_PAGE_ERROR)
+			{
 				const auto accessType = a_exception.ExceptionInformation[0] == 0 ? "read" :
-					a_exception.ExceptionInformation[0] == 1 ? "write" :
-					a_exception.ExceptionInformation[0] == 8 ? "execute" :
-					"unknown";
+										a_exception.ExceptionInformation[0] == 1 ? "write" :
+										a_exception.ExceptionInformation[0] == 8 ? "execute" :
+																				   "unknown";
 				const auto faultAddress = a_exception.ExceptionInformation[1];
 				const auto ntStatus = a_exception.ExceptionInformation[2];
 				a_log.critical("In-Page Error: Tried to {} memory at 0x{:012X}, NTSTATUS: 0x{:08X}"sv, accessType, faultAddress, ntStatus);
 			}
-			else if (a_exception.NumberParameters > 0) {
+			else if (IsCppException(a_exception))
+			{
+				// Parse and display C++ exception details
+				// Wrap entire C++ exception parsing in try-catch to prevent secondary crashes
+				try
+				{
+					if (const auto cppExInfo = ParseCppException(a_exception))
+					{
+						a_log.critical("");
+						a_log.critical("C++ EXCEPTION:");
+
+						// Use existing introspection system to analyze the exception object
+						try
+						{
+							const std::size_t addresses[] = { cppExInfo->objectAddress };
+							const auto analysis = Introspection::analyze_data(addresses, a_modules);
+
+							if (!analysis.empty() && !analysis[0].empty())
+							{
+								// The introspection system provides full type information with details
+								a_log.critical("\tType: {}"sv, analysis[0]);
+							}
+							else
+							{
+								// Fallback to our manual parsing if introspection fails
+								a_log.critical("\tType: {}"sv, cppExInfo->typeName);
+							}
+						}
+						catch (...)
+						{
+							// If introspection fails, use fallback type name
+							a_log.critical("\tType: {}"sv, cppExInfo->typeName);
+						}
+
+						// Always try to extract additional info from the exception object (e.g., HRESULT)
+						try
+						{
+							if (cppExInfo->what)
+								a_log.critical("\tInfo: {}"sv, *cppExInfo->what);
+						}
+						catch (...)
+						{
+							a_log.critical("\tInfo: <failed to extract>"sv);
+						}
+
+						// Show the throw location if available (extracted from callstack)
+						try
+						{
+							if (!a_throwLocation.empty())
+								a_log.critical("\tThrow Location: {}"sv, a_throwLocation);
+						}
+						catch (...)
+						{
+							a_log.critical("\tThrow Location: <failed to format>"sv);
+						}
+
+						// Log module information
+						try
+						{
+							const auto modulePtr = reinterpret_cast<const void*>(cppExInfo->moduleBase);
+							const auto mod = Introspection::get_module_for_pointer(modulePtr, a_modules);
+							if (mod)
+								a_log.critical("\tModule: {}"sv, mod->name());
+						}
+						catch (...)
+						{
+							a_log.critical("\tModule: <failed to determine>"sv);
+						}
+					}
+					else
+						a_log.critical("C++ Exception: Failed to parse exception details");
+				}
+				catch (const std::exception& e)
+				{
+					a_log.critical("C++ Exception: Fatal error during parsing - {}"sv, e.what());
+				}
+				catch (...)
+				{
+					a_log.critical("C++ Exception: Fatal error during parsing (unknown exception)"sv);
+				}
+			}
+			else if (a_exception.NumberParameters > 0)
+			{
 				a_log.critical("Exception Information Parameters:");
-				for (std::size_t i = 0; i < a_exception.NumberParameters; ++i) {
-					a_log.critical("\tParameter[{}]: 0x{:012X}"sv, i, a_exception.ExceptionInformation[i]);
+				for (std::size_t i = 0; i < a_exception.NumberParameters; ++i)
+				{
+					try
+					{
+						const auto param = a_exception.ExceptionInformation[i];
+						const std::size_t params[] = { param };
+						const auto analysis = Introspection::analyze_data(params, a_modules);
+
+						if (!analysis.empty() && !analysis[0].empty())
+							a_log.critical("\tParameter[{}]: 0x{:012X} {}"sv, i, param, analysis[0]);
+						else
+							a_log.critical("\tParameter[{}]: 0x{:012X}"sv, i, param);
+					}
+					catch (...)
+					{
+						a_log.critical("\tParameter[{}]: <failed to analyze>"sv, i);
+					}
 				}
 			}
 
-			// Check for nested exceptions
-			if (a_exception.ExceptionRecord) {
-				a_log.critical("Nested Exception:");
-				print_exception(a_log, *a_exception.ExceptionRecord, a_modules);  // Recursively print nested exception
+			// Check for nested exceptions (with depth limit to prevent infinite recursion)
+			static thread_local int exception_depth = 0;
+			constexpr int MAX_EXCEPTION_DEPTH = 10;
+			if (a_exception.ExceptionRecord && exception_depth < MAX_EXCEPTION_DEPTH)
+			{
+				a_log.critical("Nested Exception (depth {}):", exception_depth + 1);
+				++exception_depth;
+				try
+				{
+					print_exception(a_log, *a_exception.ExceptionRecord, a_modules, "", nullptr);
+				}
+				catch (...)
+				{
+					a_log.critical("Failed to process nested exception at depth {}", exception_depth);
+				}
+				--exception_depth;
 			}
+			else if (a_exception.ExceptionRecord && exception_depth >= MAX_EXCEPTION_DEPTH)
+				a_log.critical("Nested exception depth limit reached ({}), stopping recursion", MAX_EXCEPTION_DEPTH);
 #undef EXCEPTION_CASE
 		}
 
@@ -309,56 +838,150 @@ namespace Crash
 		{
 			a_log.critical("F4SE PLUGINS:"sv);
 
-			const auto ci = [](std::string_view a_lhs, std::string_view a_rhs) {
+			const auto ci = [](std::string_view a_lhs, std::string_view a_rhs)
+			{
 				const auto cmp = _strnicmp(a_lhs.data(), a_rhs.data(), std::min(a_lhs.size(), a_rhs.size()));
 				return cmp == 0 && a_lhs.length() != a_rhs.length() ? a_lhs.length() < a_rhs.length() : cmp < 0;
-				};
+			};
 
-			const auto modules = [&]() {
+			const auto modules = [&]()
+			{
 				std::set<std::string_view, decltype(ci)> result;
-				for (const auto& mod : a_modules) {
+				for (const auto& mod : a_modules)
+				{
 					result.insert(mod->name());
 				}
 
 				return result;
-				}();
+			}();
 
-			using value_type = std::pair<std::string, std::optional<REL::Version>>;
-			std::vector<value_type> plugins;
-			for (const auto& m : modules) {
-				try {
-					std::filesystem::path pluginDir{ Crash::PDB::sPluginPath };
-					std::filesystem::path filename = pluginDir.append(m);
-					if (std::filesystem::exists(filename))
-						plugins.emplace_back(*std::move(std::make_optional(m)), REL::GetFileVersion(filename.wstring()));
+			// Helper: attempt to read FileVersion string from version resource
+			auto get_file_version_string = [&](const std::filesystem::path& filename) -> std::optional<std::string>
+			{
+				DWORD handle = 0;
+				const auto pathW = filename.wstring();
+				const auto size = GetFileVersionInfoSizeW(pathW.c_str(), &handle);
+				if (size == 0)
+					return std::nullopt;
+
+				std::vector<std::byte> data(size);
+				if (!GetFileVersionInfoW(pathW.c_str(), handle, size, data.data()))
+					return std::nullopt;
+
+				// Try StringFileInfo translation entry first
+				struct LANGANDCODEPAGE
+				{
+					WORD wLanguage;
+					WORD wCodePage;
+				};
+				LANGANDCODEPAGE* trans = nullptr;
+				UINT transLen = 0;
+				if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&trans), &transLen) && transLen >= sizeof(LANGANDCODEPAGE))
+				{
+					wchar_t block[64];
+					swprintf(block, std::size(block), L"\\StringFileInfo\\%04x%04x\\FileVersion", trans[0].wLanguage, trans[0].wCodePage);
+					LPWSTR value = nullptr;
+					UINT valueLen = 0;
+					if (VerQueryValueW(data.data(), block, reinterpret_cast<LPVOID*>(&value), &valueLen) && valueLen > 0)
+					{
+						std::wstring ws(value, valueLen);
+						// trim trailing whitespace/newlines
+						while (!ws.empty() && iswspace(ws.back())) ws.pop_back();
+						return util::utf16_to_utf8(ws).value_or(std::string());
+					}
 				}
-				catch (const std::exception& e) {
+
+				// Fallback: use fixed file info
+				VS_FIXEDFILEINFO* ffi = nullptr;
+				UINT ffiLen = 0;
+				if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffiLen) && ffi)
+				{
+					const auto major = HIWORD(ffi->dwFileVersionMS);
+					const auto minor = LOWORD(ffi->dwFileVersionMS);
+					const auto build = HIWORD(ffi->dwFileVersionLS);
+					const auto rev = LOWORD(ffi->dwFileVersionLS);
+					return fmt::format("{}.{}.{}.{}", major, minor, build, rev);
+				}
+
+				return std::nullopt;
+			};
+
+			struct PluginInfo
+			{
+				std::string name;
+				std::optional<REL::Version> version;
+				std::optional<std::string> version_str;  // fallback raw/string version
+			};
+
+			std::vector<PluginInfo> plugins;
+			for (const auto& m : modules)
+			{
+				try
+				{
+					std::filesystem::path pluginDir{ Crash::PDB::sPluginPath };
+					std::filesystem::path filename = pluginDir;
+					filename.append(m);
+					if (std::filesystem::exists(filename))
+					{
+						try
+						{
+							plugins.push_back({ std::string(m), REL::GetFileVersion(filename.wstring()), std::nullopt });
+						}
+						catch (const std::exception&)
+						{
+							// Fallback: try to read whatever version string we can from the file resources
+							auto vs = get_file_version_string(filename);
+							if (vs)
+								plugins.push_back({ std::string(m), std::nullopt, *vs });
+							else
+								plugins.push_back({ std::string(m), std::nullopt, std::nullopt });
+						}
+					}
+				}
+				catch (const std::exception& e)
+				{
 					a_log.critical("Skipping module {}:{}"sv, m, e.what());
+				}
+				catch (...)
+				{
+					a_log.critical("Skipping module {}:<unknown error>"sv, m);
 				}
 			}
 			std::sort(plugins.begin(), plugins.end(),
-				[=](const value_type& a_lhs, const value_type& a_rhs) { return ci(a_lhs.first, a_rhs.first); });
-			for (const auto& [plugin, version] : plugins) {
-				const auto ver = [&]() {
-					if (version) {
-						std::span view{ version->begin(), version->end() };
-						const auto it = std::find_if(view.rbegin(), view.rend(),
-							[](std::uint16_t a_val) noexcept { return a_val != 0; });
-						if (it != view.rend()) {
-							std::string result = " v";
-							std::string_view pre;
-							for (std::size_t i = 0; i < static_cast<std::size_t>(view.rend() - it); ++i) {
-								result += pre;
-								result += fmt::to_string(view[i]);
-								pre = "."sv;
-							}
-							return result;
-						}
-					}
-					return ""s;
-					}();
+				[=](const PluginInfo& a_lhs, const PluginInfo& a_rhs) { return ci(a_lhs.name, a_rhs.name); });
 
-				a_log.critical("\t{}{}"sv, plugin, ver);
+			for (const auto& p : plugins)
+			{
+				if (p.version)
+				{
+					const auto ver = [&]()
+					{
+						if (p.version)
+						{
+							std::span view{ p.version->begin(), p.version->end() };
+							const auto it = std::find_if(view.rbegin(), view.rend(),
+								[](std::uint16_t a_val) noexcept { return a_val != 0; });
+							if (it != view.rend())
+							{
+								std::string result = " v";
+								std::string_view pre;
+								for (std::size_t i = 0; i < static_cast<std::size_t>(view.rend() - it); ++i)
+								{
+									result += pre;
+									result += fmt::to_string(view[i]);
+									pre = "."sv;
+								}
+								return result;
+							}
+						}
+						return ""s;
+					}();
+					a_log.critical("\t{}{}"sv, p.name, ver);
+				}
+				else if (p.version_str)
+					a_log.critical("\t{} v{}"sv, p.name, *p.version_str);
+				else
+					a_log.critical("\t{}"sv, p.name);
 			}
 		}
 
@@ -366,23 +989,22 @@ namespace Crash
 		{
 			a_log.critical("MODULES:"sv);
 
-			const auto format = [&]() {
-				const auto width = [&]() {
+			const auto format = [&]()
+			{
+				const auto width = [&]()
+				{
 					std::size_t max = 0;
 					std::for_each(a_modules.begin(), a_modules.end(),
 						[&](auto&& a_elem) { max = std::max(max, a_elem->name().length()); });
 					return max;
-					}();
-
-				return "\t{:<"s + fmt::to_string(width) + "} 0x{:012X}"s;
 				}();
 
-			for (const auto& mod : a_modules) {
-				a_log.critical(fmt::format(
-					fmt::runtime(format),
-					mod->name(),
-					mod->address()
-				));
+				return "\t{:<"s + fmt::to_string(width) + "} 0x{:012X}"s;
+			}();
+
+			for (const auto& mod : a_modules)
+			{
+				a_log.critical(fmt::format(fmt::runtime(format), mod->name(), mod->address()));
 			}
 		}
 
@@ -391,76 +1013,74 @@ namespace Crash
 			a_log.critical("PLUGINS:"sv);
 
 			const auto datahandler = RE::TESDataHandler::GetSingleton();
-			if (datahandler) {
+			if (datahandler)
+			{
 				auto modCount = 0;
 				auto lightCount = 0;
-					auto compiledFileCollection = datahandler->compiledFileCollection;
-					if (!compiledFileCollection.files.empty() || !compiledFileCollection.files.empty()) {
-						const auto& [files, smallfiles] = compiledFileCollection;
-						const auto fileFormat = [&]() {
-							return "\t[{:>02X}]{:"s + (!smallfiles.empty() ? "5"s : "1"s) + "}{}"s;
-							}();
+				auto compiledFileCollection = datahandler->compiledFileCollection;
+				if (!compiledFileCollection.files.empty() || !compiledFileCollection.files.empty())
+				{
+					const auto& [files, smallfiles] = compiledFileCollection;
+					const auto fileFormat = [&]()
+					{
+						return "\t[{:>02X}]{:"s + (!smallfiles.empty() ? "5"s : "1"s) + "}{}"s;
+					}();
 
-						modCount = files.size();
-						lightCount = smallfiles.size();
-						a_log.critical("\tLight: {}\tRegular: {}\tTotal: {}"sv, lightCount, modCount, lightCount + modCount);
-						for (const auto& file : files) {
-							a_log.critical(fmt::format(
-								fmt::runtime(fileFormat),
-								file->GetCompileIndex(),
-								"",
-								file->GetFilename()
-							));
-
-						}
-
-						for (const auto& file : smallfiles) {
-							a_log.critical(fmt::format(
-								"\t[FE:{:>03X}] {}",
-								file->GetSmallFileCompileIndex(),
-								file->GetFilename()
-							));
-						}
+					modCount = files.size();
+					lightCount = smallfiles.size();
+					a_log.critical("\tLight: {}\tRegular: {}\tTotal: {}"sv, lightCount, modCount, lightCount + modCount);
+					for (const auto& file : files)
+					{
+						a_log.critical(fmt::format(fmt::runtime(fileFormat), file->GetCompileIndex(), "", file->GetFilename()));
 					}
+
+					for (const auto& file : smallfiles)
+					{
+						a_log.critical(fmt::format("\t[FE:{:>03X}] {}", file->GetSmallFileCompileIndex(), file->GetFilename()));
+					}
+				}	
 			}
 		}
 
-		void print_registers(spdlog::logger& a_log, const ::CONTEXT& a_context,
-			std::span<const module_pointer> a_modules)
+		void print_relevant_objects_section(spdlog::logger& a_log, const RelevantObjectsCollection& collection)
 		{
-			a_log.critical("REGISTERS:"sv);
+			a_log.critical("POSSIBLE RELEVANT OBJECTS:"sv);
 
-			const std::array regs{
-				std::make_pair("RAX"sv, a_context.Rax),
-				std::make_pair("RCX"sv, a_context.Rcx),
-				std::make_pair("RDX"sv, a_context.Rdx),
-				std::make_pair("RBX"sv, a_context.Rbx),
-				std::make_pair("RSP"sv, a_context.Rsp),
-				std::make_pair("RBP"sv, a_context.Rbp),
-				std::make_pair("RSI"sv, a_context.Rsi),
-				std::make_pair("RDI"sv, a_context.Rdi),
-				std::make_pair("R8"sv,	a_context.R8),
-				std::make_pair("R9"sv,	a_context.R9),
-				std::make_pair("R10"sv, a_context.R10),
-				std::make_pair("R11"sv, a_context.R11),
-				std::make_pair("R12"sv, a_context.R12),
-				std::make_pair("R13"sv, a_context.R13),
-				std::make_pair("R14"sv, a_context.R14),
-				std::make_pair("R15"sv, a_context.R15),
-			};
+			try
+			{
+				const auto sortedObjects = collection.get_sorted();
 
-			std::array<std::size_t, regs.size()> todo{};
-			for (std::size_t i = 0; i < regs.size(); ++i) {
-				todo[i] = regs[i].second;
+				// Print up to 128 most relevant objects
+				constexpr std::size_t MAX_OBJECTS = 128;
+				const auto objectCount = std::min(sortedObjects.size(), MAX_OBJECTS);
+
+				if (objectCount == 0)
+					a_log.critical("\tNone found"sv);
+				else
+				{
+					for (std::size_t i = 0; i < objectCount; ++i)
+					{
+						const auto& obj = sortedObjects[i];
+						// Simplify the full analysis for concise display
+						const auto simplified = Introspection::simplify_for_relevant_objects(obj.full_analysis);
+						if (!simplified.empty())
+							a_log.critical("\t{}: {}"sv, obj.location, simplified);
+					}
+					if (sortedObjects.size() > MAX_OBJECTS)
+						a_log.critical("\t... and {} more (truncated)"sv, sortedObjects.size() - MAX_OBJECTS);
+				}
 			}
-			const auto analysis = Introspection::analyze_data(todo, a_modules);
-			for (std::size_t i = 0; i < regs.size(); ++i) {
-				const auto& [name, reg] = regs[i];
-				a_log.critical("\t{:<3} 0x{:<16X} {}"sv, name, reg, analysis[i]);
+			catch (const std::exception& e)
+			{
+				a_log.critical("\tFailed to print objects: {}"sv, e.what());
+			}
+			catch (...)
+			{
+				a_log.critical("\tFailed to print objects: unknown error"sv);
 			}
 		}
 
-		void print_settings(spdlog::logger& a_log, bool BotCompatMode)
+		void print_settings(spdlog::logger& a_log)
 		{
 			std::filesystem::path ConfigFile = "Data/F4SE/Plugins/Addictol.toml";
 		
@@ -477,15 +1097,16 @@ namespace Crash
 				return;
 			}
 
-			std::unordered_map<std::string, std::string> MainValues;
 			std::string line;
 			std::string current_group;
 
 			auto trim = [](std::string& s)
-				{
-					s.erase(0, s.find_first_not_of(" \t"));
-					s.erase(s.find_last_not_of(" \t") + 1);
-				};
+			{
+				s.erase(0, s.find_first_not_of(" \t"));
+				s.erase(s.find_last_not_of(" \t") + 1);
+			};
+
+			a_log.critical("SETTINGS:"sv);
 
 			while (std::getline(file, line))
 			{
@@ -501,11 +1122,8 @@ namespace Crash
 				// [GroupName]
 				if (line.front() == '[' && line.back() == ']')
 				{
-					if (!BotCompatMode)
-					{
-						current_group = line.substr(1, line.size() - 2);
-						a_log.critical("\t[{}]", current_group);
-					}
+					current_group = line.substr(1, line.size() - 2);
+					a_log.critical("\t[{}]", current_group);
 
 					continue;
 				}
@@ -528,175 +1146,7 @@ namespace Crash
 				trim(key);
 				trim(value);
 
-				if (!BotCompatMode)
-					a_log.critical("\t\t{}: {}", key, value);
-				else
-					MainValues[key] = value;
-			}
-
-			// Compatibility Mode Config
-			if (BotCompatMode)
-			{
-				// Open the Config
-				ConfigFile = "Data/F4SE/Plugins/CompatibilityModeConfig.toml";
-
-				if (!std::filesystem::exists(ConfigFile))
-				{
-					REX::WARN("Compatibility Config File was not found at: {}", ConfigFile.string());
-					return;
-				}
-
-				std::ifstream compatibilityFile(ConfigFile);
-				if (!compatibilityFile.is_open())
-				{
-					REX::WARN("Failed to open the Compatibility Config File at: {}", ConfigFile.string());
-					return;
-				}
-
-				// Add some missing Settings
-				MainValues["bWaitForDebugger"] = bWaitForDebugger.GetValue() ? "true" : "false";
-				MainValues["sSymcache"] = PDB::sSymcache.GetValue();
-
-				// F4EE is fixed in NG / AE
-				if (REL::Module::IsRuntimeOG())
-					MainValues["bF4EE"] = "false";
-				else
-					MainValues["bF4EE"] = "true";
-
-				// Key Map
-				const std::unordered_map<std::string, std::string> KeyMap =
-				{
-					// Compatibility
-					{"F4EE", "bF4EE"},
-
-					// Debug
-					{"Symcache", "sSymcache"},
-					{"WaitForDebugger", "bWaitForDebugger"},
-
-					// Fixes
-					{"ActorIsHostileToActor", "bActorIsHostileToActor"},
-					{"BGSAIWorldLocationRefRadiusNull", "bBGSAIWorldLocationRefRadius"},
-					{"CellInit", "bCellInit"},
-					{"CreateD3DAndSwapChain", "bCreateD3DAndSwapchain"},
-					{"EncounterZoneReset", "bEncounterZoneReset"},
-					{"GreyMovies", "bGreyMovies"},
-					{"EscapeFreeze", "bEscapeFreeze"},
-					{"InteriorNavCut", "bInteriorNavCut"},
-					{"FixScriptPageAllocation", "bBakaMaxPapyrusOps"},
-					{"FixToggleScriptsCommand", "bBakaMaxPapyrusOps"},
-					{"MagicEffectApplyEvent", "bMagicEffectApplyEvent"},
-					{"MovementPlanner", "bMovementPlanner"},
-					{"PackageAllocateLocation", "bPackageAllocateLocation"},
-					{"SafeExit", "bSafeExit"},
-					{"TESObjectREFRGetEncounterZone", "bTESObjectREFRGetEncounterZone"},
-					{"UnalignedLoad", "bUnalignedLoad"},
-					{"WorkBenchSwap", "bWorkbenchSwap"},
-					{"PipboyLightInvFix", "bPipBoyLightInv"},
-
-					// Patches
-					{"Achievements", "bAchievements"},
-					{"BSMTAManager", "bBSMTAManager"},
-					{"BSPreCulledObjects", "bBSPreCulledObjects"},
-					{"INISettingCollection", "bINISettingCollection"},
-					{"InputSwitch", "bInputSwitch"},
-					{"MaxStdIO", "nMaxStdIO"},
-					{"MemoryManager", "bMemoryManager"},
-					{"ScaleformAllocator", "bScaleformAllocator"},
-					{"SmallBlockAllocator", "bSmallBlockAllocator"},
-
-					// Tweaks
-					{"MaxPapyrusOpsPerFrame", "nMaxPapyrusOpsPerFrame"},
-
-					// Warnings
-					{"ImageSpaceAdapter", "bImageSpaceAdapter"},
-				};
-
-				// Config
-				while (std::getline(compatibilityFile, line))
-				{
-					while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-					{
-						line.pop_back();
-					}
-
-					// Ignore Empty Lines and Comments
-					if (line.empty()) continue;
-					if (line[0] == ';' || line[0] == '#') continue;
-
-					// [GroupName]
-					if (line.front() == '[' && line.back() == ']')
-					{
-						current_group = line.substr(1, line.size() - 2);
-						a_log.critical("\t[{}]", current_group);
-
-						continue;
-					}
-
-					// Key/Value
-					auto eq_pos = line.find('=');
-					if (eq_pos == std::string::npos) continue;
-
-					std::string key = line.substr(0, eq_pos);
-					std::string value = line.substr(eq_pos + 1);
-
-					// Strip Inline Comments
-					auto comment_pos = value.find_first_of("#;");
-					if (comment_pos != std::string::npos)
-					{
-						value = value.substr(0, comment_pos);
-					}
-
-					// Trim Whitespace
-					trim(key);
-					trim(value);
-
-					// Override Values
-					auto it = KeyMap.find(key);
-					if (it != KeyMap.end())
-					{
-						if (MainValues.contains(it->second))
-							value = MainValues[it->second];
-					}
-
-					// Log
-					a_log.critical("\t\t{}: {}", key, value);
-				}
-			}
-		}
-
-		void print_stack(spdlog::logger& a_log, const ::CONTEXT& a_context, std::span<const module_pointer> a_modules)
-		{
-			a_log.critical("STACK:"sv);
-
-			const auto tib = reinterpret_cast<const ::NT_TIB*>(::NtCurrentTeb());
-			const auto base = tib ? static_cast<const std::size_t*>(tib->StackBase) : nullptr;
-			if (!base) {
-				a_log.critical("\tFAILED TO READ TIB"sv);
-			}
-			else {
-				const auto rsp = reinterpret_cast<const std::size_t*>(a_context.Rsp);
-				std::span stack{ rsp, base };
-
-				const auto format = [&]() {
-					return "\t[RSP+{:<"s +
-						fmt::to_string(fmt::format("{:X}"sv, (stack.size() - 1) * sizeof(std::size_t)).length()) +
-						"X}] 0x{:<16X} {}"s;
-					}();
-
-				constexpr std::size_t blockSize = 1000;
-				std::size_t idx = 0;
-				for (std::size_t off = 0; off < stack.size(); off += blockSize) {
-					const auto analysis = Introspection::analyze_data(stack.subspan(off, std::min<std::size_t>(stack.size() - off, blockSize)), a_modules);
-					for (const auto& data : analysis) {
-						a_log.critical(fmt::format(
-							fmt::runtime(format),
-							idx * sizeof(std::size_t),
-							stack[idx],
-							data
-						));
-						++idx;
-					}
-				}
+				a_log.critical("\t\t{}: {}", key, value);
 			}
 		}
 
@@ -709,9 +1159,22 @@ namespace Crash
 
 			a_log.critical("\tCPU: {} {}"sv, iware::cpu::vendor(), iware::cpu::model_name());
 
-			const auto vendor = [](iware::gpu::vendor_t a_vendor) {
+			// Add CPU core information
+			try
+			{
+				const auto cores = iware::cpu::quantities();
+				a_log.critical("\tCPU Cores: {} logical, {} physical, {} packages"sv, cores.logical, cores.physical, cores.packages);
+			}
+			catch (...)
+			{
+				a_log.critical("\tCPU Cores: Unable to determine"sv);
+			}
+
+			const auto vendor = [](iware::gpu::vendor_t a_vendor)
+			{
 				using vendor_t = iware::gpu::vendor_t;
-				switch (a_vendor) {
+				switch (a_vendor)
+				{
 				case vendor_t::intel:
 					return "Intel"sv;
 				case vendor_t::amd:
@@ -726,117 +1189,655 @@ namespace Crash
 				default:
 					return "Unknown"sv;
 				}
-				};
+			};
 
 			const auto gpus = iware::gpu::device_properties();
-			for (std::size_t i = 0; i < gpus.size(); ++i) {
+			for (std::size_t i = 0; i < gpus.size(); ++i)
+			{
 				const auto& gpu = gpus[i];
 				a_log.critical("\tGPU #{}: {} {}"sv, i + 1, vendor(gpu.vendor), gpu.name);
 			}
 
-			const auto gibibyte = [](std::uint64_t a_bytes) {
+			const auto gibibyte = [](std::uint64_t a_bytes)
+			{
 				constexpr double factor = 1024 * 1024 * 1024;
 				return static_cast<double>(a_bytes) / factor;
-				};
+			};
 
 			const auto mem = iware::system::memory();
 			a_log.critical("\tPHYSICAL MEMORY: {:.02f} GB/{:.02f} GB"sv,
 				gibibyte(mem.physical_total - mem.physical_available), gibibyte(mem.physical_total));
+			a_log.critical("\tVIRTUAL MEMORY: {:.02f} GB/{:.02f} GB"sv,
+				gibibyte(mem.virtual_total - mem.virtual_available), gibibyte(mem.virtual_total));
+
+			// Process memory usage
+			try
+			{
+				PROCESS_MEMORY_COUNTERS_EX pmc;
+				if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+				{
+					a_log.critical("\tPROCESS MEMORY: Working Set: {:.02f} MB, Private: {:.02f} MB, Peak: {:.02f} MB"sv,
+						static_cast<double>(pmc.WorkingSetSize) / (1024 * 1024),
+						static_cast<double>(pmc.PrivateUsage) / (1024 * 1024),
+						static_cast<double>(pmc.PeakWorkingSetSize) / (1024 * 1024));
+					a_log.critical("\tPAGE FAULTS: {} (Peak: {})"sv, pmc.PageFaultCount, pmc.PeakWorkingSetSize);
+				}
+			}
+			catch (...)
+			{
+				a_log.critical("\tPROCESS MEMORY: Unable to determine"sv);
+			}
+
+			//https://forums.unrealengine.com/t/how-to-get-vram-usage-via-c/218627/2
+			try
+			{
+				IDXGIFactory4* pFactory{};
+				HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)&pFactory);
+				if (FAILED(hr))
+				{
+					a_log.critical("\tGPU MEMORY: Failed to create DXGI factory (HRESULT: {:#x})"sv, static_cast<uint32_t>(hr));
+					return;
+				}
+
+				IDXGIAdapter3* adapter{};
+				hr = pFactory->EnumAdapters(0, reinterpret_cast<IDXGIAdapter**>(&adapter));
+				if (FAILED(hr))
+				{
+					a_log.critical("\tGPU MEMORY: Failed to enumerate adapter (HRESULT: {:#x})"sv, static_cast<uint32_t>(hr));
+					pFactory->Release();
+					return;
+				}
+
+				DXGI_QUERY_VIDEO_MEMORY_INFO videoMemoryInfo;
+				hr = adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &videoMemoryInfo);
+				if (FAILED(hr))
+					a_log.critical("\tGPU MEMORY: Failed to query video memory (HRESULT: {:#x})"sv, static_cast<uint32_t>(hr));
+				else
+					a_log.critical("\tGPU MEMORY: {:.02f}/{:.02f} GB"sv, gibibyte(videoMemoryInfo.CurrentUsage),
+						gibibyte(videoMemoryInfo.Budget));
+
+				adapter->Release();
+				pFactory->Release();
+			}
+			catch (const std::exception& e)
+			{
+				a_log.critical("\tGPU MEMORY: Exception occurred: {}"sv, e.what());
+			}
+			catch (...)
+			{
+				a_log.critical("\tGPU MEMORY: Unknown exception occurred"sv);
+			}
+
+			// Detect VM
+			if (VM::detect(VM::DISABLE(VM::GAMARUE)))
+				a_log.critical("\tDetected Virtual Machine: {} ({}%)"sv, VM::brand(VM::MULTIPLE), VM::percentage());
 		}
+
+		void print_process_info(spdlog::logger& a_log)
+		{
+			a_log.critical("PROCESS INFO:"sv);
+
+			// Process ID and thread info
+			const auto pid = GetCurrentProcessId();
+			const auto tid = GetCurrentThreadId();
+			a_log.critical("\tProcess ID: {}"sv, pid);
+			a_log.critical("\tCrash Thread ID: {}"sv, tid);
+
+			// Process uptime
+			try
+			{
+				FILETIME creation_time, exit_time, kernel_time, user_time;
+				if (GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time, &kernel_time, &user_time))
+				{
+					FILETIME current_time;
+					GetSystemTimeAsFileTime(&current_time);
+
+					ULARGE_INTEGER creation, current;
+					creation.LowPart = creation_time.dwLowDateTime;
+					creation.HighPart = creation_time.dwHighDateTime;
+					current.LowPart = current_time.dwLowDateTime;
+					current.HighPart = current_time.dwHighDateTime;
+
+					const auto uptime_ms = (current.QuadPart - creation.QuadPart) / 10000;  // Convert to milliseconds
+					const auto uptime_sec = uptime_ms / 1000;
+					const auto hours = uptime_sec / 3600;
+					const auto minutes = (uptime_sec % 3600) / 60;
+					const auto seconds = uptime_sec % 60;
+
+					a_log.critical("\tProcess Uptime: {:02}:{:02}:{:02} ({}ms)"sv, hours, minutes, seconds, uptime_ms);
+				}
+			}
+			catch (...)
+			{
+				a_log.critical("\tProcess Uptime: Unable to determine"sv);
+			}
+
+			// Working directory
+			try
+			{
+				wchar_t current_dir[MAX_PATH];
+				if (GetCurrentDirectoryW(MAX_PATH, current_dir))
+				{
+					const std::wstring wdir(current_dir);
+					const std::string dir = util::utf16_to_utf8(wdir).value_or(std::string());
+					a_log.critical("\tWorking Directory: {}"sv, dir);
+				}
+			}
+			catch (...)
+			{
+				a_log.critical("\tWorking Directory: Unable to determine"sv);
+			}
+
+			// Command line and executable information
+			try
+			{
+				const auto cmd_line = GetCommandLineA();
+				if (cmd_line)
+					a_log.critical("\tCommand Line: {}"sv, cmd_line);
+
+				// Extract executable path and provide file details
+				wchar_t exePath[MAX_PATH];
+				if (GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+				{
+					const std::filesystem::path exe_path(exePath);
+					const auto hash = get_file_md5(exe_path);
+					a_log.critical("\tExecutable MD5: {}"sv, hash);
+
+					// Also get file size and timestamp
+					std::error_code ec;
+					const auto file_size = std::filesystem::file_size(exe_path, ec);
+					if (!ec)
+						a_log.critical("\tExecutable Size: {} bytes"sv, file_size);
+
+					const auto file_time = std::filesystem::last_write_time(exe_path, ec);
+					if (!ec)
+					{
+						// Convert to time_t for logging
+						const auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+							file_time - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+						const auto time_t_val = std::chrono::system_clock::to_time_t(sctp);
+						std::tm tm_val{};
+						if (localtime_s(&tm_val, &time_t_val) == 0)
+						{
+							a_log.critical("\tExecutable Modified: {:04}-{:02}-{:02} {:02}:{:02}:{:02}"sv,
+								tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+								tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec);
+						}
+					}
+				}
+			}
+			catch (...)
+			{
+				a_log.critical("\tCommand Line/Executable Info: <error retrieving>"sv);
+			}
+
+			// Process privilege level
+			try
+			{
+				HANDLE token;
+				if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+				{
+					TOKEN_ELEVATION elevation;
+					DWORD size;
+					if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size))
+						a_log.critical("\tElevated: {}"sv, elevation.TokenIsElevated ? "Yes" : "No");
+					
+					CloseHandle(token);
+				}
+			}
+			catch (...)
+			{
+				a_log.critical("\tElevated: Unable to determine"sv);
+			}
+		}
+
+		bool contains_case_insensitive(std::string_view haystack, std::string_view needle)
+		{
+			if (needle.empty())
+				return false;
+
+			auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(), [](char a, char b)
+			{
+					return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+			});
+			return it != haystack.end();
+		}
+
+		void print_thread_context(spdlog::logger& a_log, const Callstack* a_callstack, std::span<const module_pointer> a_modules)
+		{
+			a_log.critical("THREAD CONTEXT (HEURISTIC):"sv);
+
+			if (!a_callstack)
+			{
+				a_log.critical("\tUnavailable"sv);
+				return;
+			}
+
+			const auto frames = a_callstack->get_frame_info_strings(a_modules, 50);
+			if (frames.empty())
+			{
+				a_log.critical("\tNo frames available"sv);
+				return;
+			}
+
+			std::vector<std::string> indicators;
+			auto add_indicator = [&](std::string_view label)
+			{
+				if (std::find(indicators.begin(), indicators.end(), label) == indicators.end())
+					indicators.emplace_back(label);
+			};
+
+			const std::vector<std::pair<std::string, std::vector<std::string>>> threadContextHeuristics =
+			{
+				{ "Papyrus VM", { "BSScript", "Papyrus", "VirtualMachine" } },
+				{ "Havok/Physics", { "hkp", "Havok", "bhk", "hkb" } },
+				{ "Rendering", { "Render", "BSRender", "BSShader", "NiCamera" } },
+				{ "Audio", { "Audio", "XAudio", "BSAudio", "SoundHandle" } },
+				{ "Job/Task", { "Job", "Task", "JobList", "ServingThread" } }
+			};
+
+			for (const auto& [label, keywords] : threadContextHeuristics)
+			{
+				for (const auto& frame : frames)
+				{
+					for (const auto& keyword : keywords)
+					{
+						if (contains_case_insensitive(frame, keyword))
+						{
+							add_indicator(label);
+							goto next_label;  // Found match for this label, skip to next label
+						}
+					}
+				}
+
+			next_label:;
+			}
+
+			const auto priority = GetThreadPriority(GetCurrentThread());
+			a_log.critical("\tThread Priority: {}"sv, priority);
+
+			if (indicators.empty())
+			{
+				a_log.critical("\tLikely Role: Unknown (main or worker thread)"sv);
+				return;
+			}
+
+			std::string joined;
+			for (std::size_t i = 0; i < indicators.size(); ++i)
+			{
+				if (i > 0)
+					joined += ", ";
+
+				joined += indicators[i];
+			}
+			a_log.critical("\tLikely Role: {}"sv, joined);
+		}
+
+#undef SETTING_CASE
 
 		std::int32_t __stdcall UnhandledExceptions(::EXCEPTION_POINTERS* a_exception) noexcept
 		{
-#ifndef NDEBUG
-			while (!WinAPI::IsDebuggerPresent()) {}
-#else
-			if (bWaitForDebugger.GetValue())
-			{
-				REX::INFO("Waiting for Debugger to attach");
-				
-				while (!::WinAPI::IsDebuggerPresent())
-				{
-					Sleep(10);
-				}
-				if (::WinAPI::IsDebuggerPresent())
-				{
-					DebugBreak();
-				}
-			}
-#endif
 			// Install the SEH-to-C++ exception translator
 			_set_se_translator(seh_translator);
-			try {
+
+			std::filesystem::path crashLogPath;
+			std::shared_ptr<spdlog::logger> log;
+			
+			try
+			{
+				if (Settings::bWaitForDebugger.GetValue())
+				{
+					while (!IsDebuggerPresent()) {}
+
+					if (IsDebuggerPresent())
+						DebugBreak();
+				}
+
 				static std::mutex sync;
 				const std::lock_guard l{ sync };
 
 				const auto modules = Modules::get_loaded_modules();
 				const std::span cmodules{ modules.begin(), modules.end() };
-				const auto log = get_log();
+				auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
+				log = logPtr;
+				crashLogPath = logPath;
 
-				const auto print = [&](auto&& a_functor, std::string a_name = "") {
-					log->critical(""sv);
-					try {
-						a_functor();
+				// Clean up old logs
+				clean_old_files(logPath.parent_path(), "crash-"sv, ".log", Settings::iMaxCrashLogs.GetValue(), ".dmp");
+				clean_old_files(logPath.parent_path(), "crash-"sv, ".dmp", Settings::iMaxMiniDumps.GetValue());
+
+				// Write minidump if requested
+				if (Settings::bCrashLogWriteMiniDump.GetValue())
+				{
+					try
+					{
+						auto dumpPath = logPath;
+						dumpPath.replace_extension(".dmp");
+						if (write_minidump(dumpPath, a_exception))
+							log->critical("Minidump written to: {}", dumpPath.string());
+						else
+							log->critical("Failed to write minidump to: {}", dumpPath.string());
 					}
-					catch (const std::exception& e) {
+					catch (...)
+					{
+						log->critical("Exception while writing minidump");
+					}
+				}
+
+				// Collection to gather relevant objects during analysis
+				RelevantObjectsCollection relevantObjects;
+
+				const auto print = [&](auto&& a_functor, std::string a_name = "")
+				{
+					log->critical(""sv);
+					try
+					{
+						// Add timeout protection to prevent hanging on bad operations
+						auto start = std::chrono::steady_clock::now();
+						constexpr auto timeout = std::chrono::seconds(30);
+
+						a_functor();
+
+						auto elapsed = std::chrono::steady_clock::now() - start;
+						if (elapsed > std::chrono::seconds(5))
+							log->critical("\t{}: completed in {:.1f}s (slow)"sv, a_name, std::chrono::duration<double>(elapsed).count());
+					}
+					catch (const std::exception& e)
+					{
 						log->critical("\t{}:\t{}"sv, a_name, e.what());
 					}
-					catch (...) {
+					catch (...)
+					{
 						log->critical("\t{}:\tERROR"sv, a_name);
 					}
 					log->flush();
-					};
+				};
 
-				bool BotCompatMode = bBotCompatibilityMode.GetValue();
-				const auto runtimeVer = REL::Module::GetSingleton()->version();
-				log->critical("Fallout 4 v{}.{}.{}"sv, runtimeVer[0], runtimeVer[1], runtimeVer[2]);
-				if (!BotCompatMode)
-					log->critical("Addictol v{}.{}.{} {} {}"sv, PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH, __DATE__, __TIME__);
-				else
-					log->critical("Buffout 4 v{}.{}.{} {} {}"sv, PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH, __DATE__, __TIME__);
+				// Use common header logging function for crash info
+				log_common_header_info(*log, ""sv, "CRASH TIME:"sv);
 				log->flush();
 
-				print([&]() { print_exception(*log, *a_exception->ExceptionRecord, cmodules); }, "print_exception");
-				print([&]() { print_settings(*log, BotCompatMode); }, "print_settings");
+				// Check for problematic modules early in crash log (for visibility in isolated crash log files)
+				/*if (auto warning = find_problematic_module(cmodules)) {
+					log_problematic_module_warning(*log, *warning, true, false);
+					log->flush();
+				}*/
+
+				// Construct callstack early so we can extract throw location for C++ exceptions
+				std::optional<Callstack> callstack;
+				std::string throwLocation;
+				try
+				{
+					callstack.emplace(*a_exception->ExceptionRecord);
+					if (IsCppException(*a_exception->ExceptionRecord))
+						throwLocation = callstack->get_throw_location(cmodules);
+				}
+				catch (...)
+				{
+					// Callstack construction failed, continue without it
+				}
+
+				print([&]() { print_exception(*log, *a_exception->ExceptionRecord, cmodules, throwLocation, a_exception->ContextRecord); }, "print_exception");
+
+				// Reset introspection state once per crash (before all analysis)
+				Introspection::reset_analysis_state();
+
+				// Collect relevant objects from registers and stack (fast pass, no printing)
+				try
+				{
+					// Collect from registers
+					const auto [regs, regAnalysis] = analyze_registers(*a_exception->ContextRecord, cmodules);
+					for (std::size_t i = 0; i < regs.size(); ++i)
+					{
+						relevantObjects.add(regs[i].second, regAnalysis[i], std::string(regs[i].first), 0);
+					}
+
+					// Collect from stack (limited to first 512 entries)
+					const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
+					if (stack_opt)
+					{
+						const auto& stack = *stack_opt;
+						constexpr std::size_t MAX_SCAN = 512;
+						const auto limited_stack = stack.subspan(0, std::min(stack.size(), MAX_SCAN));
+						const auto stack_analyses = analyze_stack_blocks(limited_stack, cmodules);
+
+						std::size_t global_idx = 0;
+						for (std::size_t block_idx = 0; block_idx < stack_analyses.size(); ++block_idx)
+						{
+							const auto& analysis = stack_analyses[block_idx];
+							for (std::size_t idx = 0; idx < analysis.size(); ++idx)
+							{
+								const auto distance = global_idx * sizeof(std::size_t);
+								relevantObjects.add(stack[global_idx], analysis[idx], fmt::format("RSP+{:X}", distance), distance + 1000);
+								++global_idx;
+							}
+						}
+					}
+				}
+				catch (...)
+				{
+					// If object collection fails, continue without it
+				}
+
+				// Print relevant objects section (after exception, before other sections)
+				print([&]() { print_relevant_objects_section(*log, relevantObjects); }, "print_relevant_objects");
+
+				print([&]() { print_process_info(*log); }, "print_process_info");
+				print([&]() { print_thread_context(*log, callstack ? &(*callstack) : nullptr, cmodules); }, "print_thread_context");
+				if (Settings::bPrintSettings.GetValue())
+					print([&]() { print_settings(*log); }, "print_sysinfo");
 				print([&]() { print_sysinfo(*log); }, "print_sysinfo");
+				/*if (REL::Module::IsVR())
+					print([&]() { print_vrinfo(*log); }, "print_vrinfo");*/
 
-				print(
-					[&]() {
-						const Callstack callstack{ *a_exception->ExceptionRecord };
-						callstack.print(*log, cmodules);
-					},
-					"probable_callstack");
+				print([&]()
+				{
+					try
+					{
+						const Callstack* callstack_ptr = callstack ? &(*callstack) : nullptr;
+						Callstack fallback{ *a_exception->ExceptionRecord };
+						if (!callstack_ptr)
+							callstack_ptr = &fallback;
 
-				print([&]() { print_registers(*log, *a_exception->ContextRecord, cmodules); }, "print_registers");
-				print([&]() { print_stack(*log, *a_exception->ContextRecord, cmodules); }, "print_raw_stack");
+						const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
+						if (!stack_opt)
+						{
+							log->critical("CALL STACK (HYBRID):");
+							log->critical("\tFAILED TO READ TIB");
+							callstack_ptr->print(*log, cmodules);
+							return;
+						}
+
+						const auto probable_frames = callstack_ptr->get_frame_addresses();
+						print_hybrid_callstack(*log, probable_frames, *stack_opt, cmodules);
+					}
+					catch (const std::bad_alloc&)
+					{
+						log->critical("CALLSTACK ANALYSIS FAILED: Out of memory");
+					}
+					catch (...)
+					{
+						log->critical("CALLSTACK ANALYSIS FAILED: Unknown error in stack analysis");
+						// Fallback: try to at least log the exception address
+						try
+						{
+							const auto addr = reinterpret_cast<std::uintptr_t>(a_exception->ExceptionRecord->ExceptionAddress);
+							log->critical("Exception occurred at address: 0x{:012X}", addr);
+						}
+						catch (...)
+						{
+							log->critical("Unable to retrieve exception address");
+						}
+					}
+				}, "hybrid_callstack");
+
+				// Analyze registers and stack first, then backfill, then print
+				try
+				{
+					// Helper struct for uniform backfill processing
+					struct AnalysisBlock
+					{
+						std::vector<std::string> analysis;
+						std::span<const std::size_t> addresses;
+					};
+					std::vector<AnalysisBlock> allBlocks;
+
+					// Analyze registers
+					const auto [regs, regAnalysis] = analyze_registers(*a_exception->ContextRecord, cmodules);
+					const auto [dummy_regs, regValues] = get_register_info(*a_exception->ContextRecord);
+					allBlocks.push_back({ regAnalysis, regValues });
+
+					// Analyze stack blocks
+					const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
+					if (stack_opt)
+					{
+						const auto& stack = *stack_opt;
+						constexpr std::size_t MAX_SCAN = 512;
+						const auto scanSize = std::min(stack.size(), MAX_SCAN);
+
+						constexpr std::size_t blockSize = 256;
+						for (std::size_t off = 0; off < scanSize; off += blockSize)
+						{
+							auto block = stack.subspan(off, std::min<std::size_t>(scanSize - off, blockSize));
+							auto analysis = Introspection::analyze_data(block, cmodules, [&](size_t i) { return fmt::format("RSP+{:X}", (off + i) * sizeof(std::size_t)); });
+							allBlocks.push_back({ std::move(analysis), block });
+						}
+					}
+
+					// Backfill all analyzed data uniformly
+					for (auto& block : allBlocks)
+					{
+						Introspection::backfill_void_pointers(block.analysis, block.addresses);
+					}
+
+					// Extract backfilled results for printing
+					auto& finalRegAnalysis = allBlocks[0].analysis;
+					std::vector<std::vector<std::string>> stackAnalyses;
+					for (size_t i = 1; i < allBlocks.size(); ++i)
+					{
+						stackAnalyses.push_back(std::move(allBlocks[i].analysis));
+					}
+
+					// Print with pre-analyzed data
+					print([&]() { print_registers(*log, *a_exception->ContextRecord, cmodules, finalRegAnalysis); }, "print_registers");
+					print([&]() { print_stack(*log, *a_exception->ContextRecord, cmodules, stackAnalyses); }, "print_raw_stack");
+				}
+				catch (...)
+				{
+					// Fallback to original behavior if analysis fails
+					print([&]() { print_registers(*log, *a_exception->ContextRecord, cmodules); }, "print_registers");
+					print([&]() { print_stack(*log, *a_exception->ContextRecord, cmodules); }, "print_raw_stack");
+				}
 				print([&]() { print_modules(*log, cmodules); }, "print_modules");
 				print([&]() { print_xse_plugins(*log, cmodules); }, "print_xse_plugins");
 				print([&]() { print_plugins(*log); }, "print_plugins");
 
-				// Print Actual Addictol Settings
-				if (BotCompatMode)
+				// Ensure all log data is written to disk before we try to open the file
+				log->flush();
+			}
+			catch (const SEHException& se)
+			{
+				// Log the SEH exception to the existing log (or create new if needed)
+				// Wrap in try-catch to prevent std::terminate from noexcept function
+				try
 				{
-					log->critical("\nAddictol Settings:"sv);
-					print([&]() { print_settings(*log, false); }, "print_settings");
+					if (!log)
+					{
+						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
+						log = logPtr;
+						crashLogPath = logPath;
+					}
+					log->critical("");
+					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+					log->critical("SEH Exception occurred during crash log generation: {} (Code: 0x{:X})", se.what(), se.code());
+					log->critical("The crash log above may be incomplete.");
+					log->flush();
+				}
+				catch (...)
+				{
+					// Last resort: can't create logger or log failed, just terminate
+					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+					return EXCEPTION_CONTINUE_SEARCH;
 				}
 			}
-			catch (const SEHException& se) {
-				// Log the SEH exception converted to a C++ exception
-				const auto log = get_log();
-				log->critical("SEH Exception caught: {} (Code: 0x{:X})", se.what(), se.code());
+			catch (const std::exception& e)
+			{
+				// Log the C++ exception to the existing log (or create new if needed)
+				// Wrap in try-catch to prevent std::terminate from noexcept function
+				try
+				{
+					if (!log)
+					{
+						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
+						log = logPtr;
+						crashLogPath = logPath;
+					}
+					log->critical("");
+					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+					log->critical("C++ exception occurred during crash log generation: {}", e.what());
+					log->critical("The crash log above may be incomplete.");
+					log->flush();
+				}
+				catch (...)
+				{
+					// Last resort: can't create logger or log failed, just terminate
+					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+					return EXCEPTION_CONTINUE_SEARCH;
+				}
 			}
-			catch (const std::exception& e) {
-				// Log the C++ exception
-				const auto log = get_log();
-				log->critical("Caught C++ exception: {}", e.what());
+			catch (...)
+			{
+				// Catch any other unknown exception to the existing log (or create new if needed)
+				// Wrap in try-catch to prevent std::terminate from noexcept function
+				try {
+					if (!log)
+					{
+						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
+						log = logPtr;
+						crashLogPath = logPath;
+					}
+					log->critical("");
+					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+					log->critical("Unknown exception occurred during crash log generation");
+					log->critical("The crash log above may be incomplete.");
+					log->flush();
+				}
+				catch (...)
+				{
+					// Last resort: can't create logger or log failed, just terminate
+					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+					return EXCEPTION_CONTINUE_SEARCH;
+				}
 			}
-			catch (...) {
-				// Catch any other unknown exception
-				const auto log = get_log();
-				log->critical("Caught an unknown exception");
+
+			// Upload crash log to pastebin if enabled
+			bool uploadedToWeb = false;
+			if (Settings::bAutoUploadCrashLog.GetValue())
+			{
+				try
+				{
+					const auto pasteUrl = upload_log_to_pastebin(crashLogPath);
+					if (!pasteUrl.empty())
+					{
+						//RE::DebugMessageBox(fmt::format("Crash log uploaded to pastebin.com!\n\nURL: {}\n\n(URL copied to clipboard and opened in browser)", pasteUrl).c_str());
+						uploadedToWeb = true;
+					}
+					//else
+						//RE::DebugMessageBox("Failed to upload crash log to pastebin.\nCheck that you have a valid Pastebin API Key in AddictolCrashLogger.ini\n\nGet a free key from: https://pastebin.com/doc_api#1");
+				}
+				catch (...)
+				{
+					//REX::ERROR("Failed to upload crash log");
+					REX::WARN("Failed to upload crash log");
+				}
 			}
-			REX::W32::TerminateProcess(REX::W32::GetCurrentProcess(), EXIT_FAILURE);
-			return 1;
+
+			// Auto-open crash log if enabled (skip if uploaded to web to avoid focus stealing)
+			if (!uploadedToWeb)
+				auto_open_log(crashLogPath);
+
+			TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
 		std::int32_t _stdcall VectoredExceptions(::EXCEPTION_POINTERS*) noexcept
@@ -848,12 +1849,28 @@ namespace Crash
 
 	bool Install()
 	{
-		const auto success =
-			::AddVectoredExceptionHandler(1, reinterpret_cast<::PVECTORED_EXCEPTION_HANDLER>(&VectoredExceptions));
-		if (success == nullptr) {
-			REX::FAIL("Failed to Install Vectored Exception Handler"sv);
+		crashPath = GetF4SELogDirectory();
+
+		auto crashLogDirectory = Settings::sCrashLogDirectory.GetValue();
+		if (!crashLogDirectory.empty())
+		{
+			if (std::filesystem::exists(crashLogDirectory) && std::filesystem::is_directory(crashLogDirectory))
+				crashPath = crashLogDirectory;
 		}
+
+		REX::INFO("Crash Log Directory: {}"sv, crashPath.string());
+
+		const auto success = ::AddVectoredExceptionHandler(1, reinterpret_cast<::PVECTORED_EXCEPTION_HANDLER>(&VectoredExceptions));
+		if (success == nullptr)
+			REX::FAIL("Failed to Install Vectored Exception Handler"sv);
+		
 		REX::INFO("Installed Crash Handlers"sv);
+
+		// Start Hotkey Monitoring Thread
+		StartHotkeyMonitoring();
+
+		// Initialize PDB Handler
+		Crash::PDB::hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
 		return success;
 	}
