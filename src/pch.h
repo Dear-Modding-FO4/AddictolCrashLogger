@@ -4,7 +4,7 @@
 
 #include <RE/Fallout.h>
 #include <F4SE/F4SE.h>
-#include <REX/REX/INI.h>
+#include <REX/REX/TOML.h>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX

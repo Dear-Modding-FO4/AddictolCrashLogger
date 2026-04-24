@@ -42,8 +42,8 @@ namespace Main
             REX::INFO("Addictol's Crash Logger Initializing...");
 
             // Load the Config
-            const auto config = REX::INI::SettingStore::GetSingleton();
-            config->Init("Data/F4SE/Plugins/AddictolCrashLogger.ini", "Data/F4SE/Plugins/AddictolCrashLoggerCustom.ini");
+            const auto config = REX::TOML::SettingStore::GetSingleton();
+            config->Init("Data/F4SE/Plugins/AddictolCrashLogger.toml", "Data/F4SE/Plugins/AddictolCrashLoggerCustom.toml");
             config->Load();
 
             // Install Crash Logger

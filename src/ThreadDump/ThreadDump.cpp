@@ -393,7 +393,7 @@ namespace Crash
 	void StartHotkeyMonitoring()
 	{
 		// Only create thread if feature is enabled AND hotkey is configured
-		if (!Settings::bEnableThreadDumpHotkey)
+		if (!Settings::bEnableThreadDumpHotkey.GetValue())
 		{
 			REX::INFO("Thread dump hotkey disabled"sv);
 			return;

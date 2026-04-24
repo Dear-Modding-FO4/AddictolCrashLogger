@@ -12,7 +12,7 @@ set_license("GPL-3.0")
 local name = "AddictolCrashLogger"
 
 -- project version
-local version = "1.2.0"
+local version = "1.3.0"
 local major, minor, patch = version:match("^(%d+)%.(%d+)%.(%d+)$")
 set_version(version)
 
@@ -30,7 +30,7 @@ add_rules("mode.release", "mode.releasedbg", "mode.debug")
 add_rules("plugin.vsxmake.autoupdate")
 
 -- add options
-set_config("commonlib_ini", true)
+set_config("commonlib_toml", true)
 set_config("commonlib_xbyak", true)
 
 -- add requires
@@ -39,7 +39,6 @@ add_requires("boost", {
         stacktrace = true
     }
 })
-add_requires("directxtk")
 add_requires("fmt")
 add_requires("frozen")
 add_requires("infoware", {
@@ -61,7 +60,6 @@ target("AddictolCrashLogger")
 
     -- add packages
     add_packages("boost")
-    add_packages("directxtk")
     add_packages("fmt")
     add_packages("frozen")
     add_packages("infoware")

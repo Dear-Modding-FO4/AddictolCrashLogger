@@ -9,9 +9,6 @@
         ["cmake#f56260b5"] = {
             version = "4.2.0"
         },
-        ["directxtk#f56260b5"] = {
-            version = "24.2.0"
-        },
         ["fmt#f56260b5"] = {
             version = "12.1.0"
         },
@@ -33,11 +30,11 @@
         ["rsm-binary-io#f56260b5"] = {
             version = "2.0.6"
         },
-        ["simpleini v4.25#f56260b5"] = {
-            version = "v4.25"
-        },
         ["spdlog v1.16.0#09c8c173"] = {
             version = "v1.16.0"
+        },
+        ["toml11 v4.4.0#f56260b5"] = {
+            version = "v4.4.0"
         },
         ["xbyak v7.06#f56260b5"] = {
             version = "v7.06"
