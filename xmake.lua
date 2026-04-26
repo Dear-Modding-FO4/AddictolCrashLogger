@@ -1,32 +1,24 @@
--- set minimum xmake version
-set_xmakever("2.8.2")
-
--- includes
+-- include subprojects
 includes("lib/commonlibf4")
 
--- set project
-set_project("AddictolCrashLogger")
+-- name and version
+local plugin_name = "AddictolCrashLogger"
+local plugin_version = "1.3.0"
+local plugin_version_major, plugin_version_minor, plugin_version_patch = plugin_version:match("^(%d+)%.(%d+)%.(%d+)$")
+
+-- set project constants
+set_project(plugin_name)
+set_version(plugin_version)
 set_license("GPL-3.0")
-
--- project name
-local name = "AddictolCrashLogger"
-
--- project version
-local version = "1.3.0"
-local major, minor, patch = version:match("^(%d+)%.(%d+)%.(%d+)$")
-set_version(version)
-
--- set defaults
 set_languages("c++23")
 set_toolchains("msvc")
 set_warnings("allextra")
 
 -- set policies
-set_policy("package.requires_lock", true)
 set_policy("build.optimization.lto", true)
 
--- add rules
-add_rules("mode.release", "mode.releasedbg", "mode.debug")
+-- add common rules
+add_rules("mode.release", "mode.releasedbg")
 add_rules("plugin.vsxmake.autoupdate")
 
 -- add options
@@ -54,8 +46,8 @@ add_requires("zydis")
 -- override runtime count
 add_defines("COMMONLIB_RUNTIMECOUNT=3")
 
--- targets
-target("AddictolCrashLogger")
+-- define targets
+target(plugin_name)
     add_cxxflags("/permissive-", "/EHa", "/Zc:preprocessor", { public = true })
 
     -- add packages
@@ -82,45 +74,12 @@ target("AddictolCrashLogger")
     -- add vmaware
     add_includedirs("lib/vmaware/src")
 
-    -- add dependencies to target
-    add_deps("commonlibf4")
-
     -- add commonlibsse plugin
     add_rules("commonlibf4.plugin", {
-        name = name,
+        name = plugin_name,
         author = "DearModdingFO4",
         description = "Addictol's Crash Logger",
-        plugin_file_data = [[
-#include <F4SE/F4SE.h>
-
-F4SE_EXPORT constinit auto F4SEPlugin_Version = []() noexcept {
-    F4SE::PluginVersionData v{};
-    v.PluginVersion({ ${PLUGIN_VERSION_MAJOR}, ${PLUGIN_VERSION_MINOR}, ${PLUGIN_VERSION_PATCH}, 0 });
-    v.PluginName("${PLUGIN_NAME}");
-    v.AuthorName("${PLUGIN_AUTHOR}");
-    v.UsesAddressLibrary(false);
-    v.UsesSigScanning(false);
-    v.IsLayoutDependent(false);
-    v.HasNoStructUse(false);
-    v.CompatibleVersions({});
-
-    std::uint32_t addressFlags = 0;
-    std::uint32_t structFlags  = 0;
-
-    // NG Support
-    addressFlags |= (1u << 1);
-    structFlags  |= (1u << 1);
-
-    // AE Support
-    addressFlags |= (1u << 2);
-    structFlags  |= (1u << 2);
-
-    v.addressIndependence = addressFlags;
-    v.structureIndependence = structFlags;
-
-    return v;
-}();
-        ]]
+        plugin_template = path.join("res/commonlibf4-plugin.cpp.in")
     })
 
     -- add src files
@@ -131,8 +90,8 @@ F4SE_EXPORT constinit auto F4SEPlugin_Version = []() noexcept {
 
     -- pass name and version
     add_defines(
-        'PLUGIN_NAME="' .. name .. '"',
-        "PLUGIN_VERSION_MAJOR=" .. major,
-        "PLUGIN_VERSION_MINOR=" .. minor,
-        "PLUGIN_VERSION_PATCH=" .. patch
+        'PLUGIN_NAME="' .. plugin_name .. '"',
+        "PLUGIN_VERSION_MAJOR=" .. plugin_version_major,
+        "PLUGIN_VERSION_MINOR=" .. plugin_version_minor,
+        "PLUGIN_VERSION_PATCH=" .. plugin_version_patch
     )

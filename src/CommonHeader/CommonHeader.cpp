@@ -34,7 +34,7 @@ namespace Crash
 		}
 
 		// Add version information
-		const auto runtimeVer = REL::Module::GetSingleton()->version();
+		const auto runtimeVer = REX::FModule::GetExecutingModule().GetFileVersion();
 		a_log.critical("Fallout 4 v{}.{}.{}"sv, runtimeVer[0], runtimeVer[1], runtimeVer[2]);
 
 		// Always include build time next to version

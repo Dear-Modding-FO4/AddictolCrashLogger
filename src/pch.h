@@ -61,7 +61,7 @@ namespace util
 
 	[[nodiscard]] inline auto module_name() -> std::string
 	{
-		const auto FileName = std::filesystem::path(REL::Module::GetSingleton()->filename()).filename().wstring();
-		return utf16_to_utf8(FileName).value_or("<Unknown Module Name>"s);
+		const auto FileName = std::filesystem::path(REX::FModule::GetExecutingModule().GetFileName());
+		return utf16_to_utf8(FileName.filename().wstring()).value_or("<Unknown Module Name>"s);
 	}
 }

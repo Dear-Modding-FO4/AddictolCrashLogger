@@ -1023,7 +1023,7 @@ namespace Crash::Introspection
 				auto result = _poly.get_formatted_name();
 				F4::filter_results xInfo;
 
-				const auto moduleBase = REL::Module::GetSingleton()->base();
+				const auto moduleBase = REX::FModule::GetExecutingModule().GetBaseAddress();
 				const auto hierarchy = _col->classDescriptor.get();
 				const std::span bases(
 					reinterpret_cast<std::uint32_t*>(hierarchy->baseClassArray.offset() + moduleBase),

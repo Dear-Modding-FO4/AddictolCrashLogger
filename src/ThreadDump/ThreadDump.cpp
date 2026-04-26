@@ -217,7 +217,7 @@ namespace Crash
 			const std::span cmodules{ modules.begin(), modules.end() };
 
 			// Get process name and plugin dir for heuristics
-			std::filesystem::path exePath = REL::Module::GetSingleton()->filename();
+			std::filesystem::path exePath = REX::FModule::GetExecutingModule().GetFileName();
 			std::string processName = exePath.string();
 			std::filesystem::path pluginDir{ Crash::PDB::sPluginPath };
 
