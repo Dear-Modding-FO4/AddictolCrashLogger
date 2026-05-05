@@ -124,6 +124,22 @@ namespace Crash
 		}
 	}
 
+	void print_registers_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules,
+		const std::vector<std::string>& pre_analyzed)
+	{
+		__try
+		{
+			print_registers(a_log, a_context, a_modules, pre_analyzed);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_registers failed!");
+		}
+	}
+
 	// Print registers with on-the-fly analysis
 	void print_registers(
 		spdlog::logger& a_log,
@@ -132,6 +148,21 @@ namespace Crash
 	{
 		const auto [regs, analysis] = analyze_registers(a_context, a_modules);
 		print_registers(a_log, a_context, a_modules, analysis);
+	}
+
+	void print_registers_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules)
+	{
+		__try
+		{
+			print_registers(a_log, a_context, a_modules);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_registers failed!");
+		}
 	}
 
 	// Print stack with pre-analyzed results
@@ -173,6 +204,22 @@ namespace Crash
 		}
 	}
 
+	void print_stack_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules,
+		const std::vector<std::vector<std::string>>& pre_analyzed_blocks)
+	{
+		__try
+		{
+			print_stack(a_log, a_context, a_modules, pre_analyzed_blocks);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_stack failed!");
+		}
+	}
+
 	// Print stack with on-the-fly analysis
 	void print_stack(
 		spdlog::logger& a_log,
@@ -190,6 +237,21 @@ namespace Crash
 
 		const auto all_analysis_results = analyze_stack_blocks(stack, a_modules);
 		print_stack(a_log, a_context, a_modules, all_analysis_results);
+	}
+
+	void print_stack_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules)
+	{
+		__try
+		{
+			print_stack(a_log, a_context, a_modules);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_stack failed!");
+		}
 	}
 
 	// Thread-dump-safe versions that use explicit stack bounds instead of TIB
@@ -537,6 +599,24 @@ namespace Crash
 			{
 				a_log.critical("[Frame {} processing failed]", i);
 			}
+		}
+	}
+
+	void print_hybrid_callstack_safeguard(
+		spdlog::logger& a_log,
+		std::span<const void* const> a_probable_frames,
+		std::span<const std::size_t> a_stack,
+		std::span<const module_pointer> a_modules,
+		std::size_t a_max_total_frames,
+		std::size_t a_max_inserted_frames)
+	{
+		__try
+		{
+			print_hybrid_callstack(a_log, a_probable_frames, a_stack, a_modules, a_max_total_frames, a_max_inserted_frames);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_hybrid_callstack failed!");
 		}
 	}
 

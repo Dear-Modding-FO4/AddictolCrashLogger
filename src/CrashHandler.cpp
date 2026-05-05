@@ -10,7 +10,7 @@
 #include "ThreadDump/ThreadDump.h"
 #include "dxgi1_4.h"
 #include <Zydis/Zydis.h>
-#include <vmaware.hpp>
+//#include <vmaware.hpp>
 #include <wincrypt.h>
 
 namespace Crash
@@ -145,7 +145,14 @@ namespace Crash
 
 	void Callstack::print(spdlog::logger& a_log, std::span<const module_pointer> a_modules) const
 	{
-		print_probable_callstack(a_log, a_modules);
+		__try
+		{
+			print_probable_callstack(a_log, a_modules);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			a_log.critical("print_probable_callstack failed!");
+		}
 	}
 
 	std::string Callstack::get_throw_location(std::span<const module_pointer> a_modules) const
@@ -865,6 +872,18 @@ namespace Crash
 #undef EXCEPTION_CASE
 		}
 
+		void print_exception_safeguard(spdlog::logger& a_log, const ::EXCEPTION_RECORD& a_exception, std::span<const module_pointer> a_modules, const std::string& a_throwLocation = "", const ::CONTEXT* a_context = nullptr)
+		{
+			__try
+			{
+				print_exception(a_log, a_exception, a_modules, a_throwLocation, a_context);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_exception failed!");
+			}
+		}
+
 		void print_xse_plugins(spdlog::logger& a_log, std::span<const module_pointer> a_modules)
 		{
 			a_log.critical("F4SE PLUGINS:"sv);
@@ -1016,6 +1035,18 @@ namespace Crash
 			}
 		}
 
+		void print_xse_plugins_safeguard(spdlog::logger& a_log, std::span<const module_pointer> a_modules)
+		{
+			__try
+			{
+				print_xse_plugins(a_log, a_modules);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_xse_plugins failed!");
+			}
+		}
+
 		void print_modules(spdlog::logger& a_log, std::span<const module_pointer> a_modules)
 		{
 			a_log.critical("MODULES:"sv);
@@ -1036,6 +1067,18 @@ namespace Crash
 			for (const auto& mod : a_modules)
 			{
 				a_log.critical(fmt::format(fmt::runtime(format), mod->name(), mod->address()));
+			}
+		}
+
+		void print_modules_safeguard(spdlog::logger& a_log, std::span<const module_pointer> a_modules)
+		{
+			__try
+			{
+				print_modules(a_log, a_modules);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_modules failed!");
 			}
 		}
 
@@ -1070,6 +1113,18 @@ namespace Crash
 						a_log.critical(fmt::format("\t[FE:{:>03X}] {}", file->GetSmallFileCompileIndex(), file->GetFilename()));
 					}
 				}	
+			}
+		}
+
+		void print_plugins_safeguard(spdlog::logger& a_log)
+		{
+			__try
+			{
+				print_plugins(a_log);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_plugins failed!");
 			}
 		}
 
@@ -1108,6 +1163,18 @@ namespace Crash
 			catch (...)
 			{
 				a_log.critical("\tFailed to print objects: unknown error"sv);
+			}
+		}
+
+		void print_relevant_objects_section_safeguard(spdlog::logger& a_log, const RelevantObjectsCollection& collection)
+		{
+			__try
+			{
+				print_relevant_objects_section(a_log, collection);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_relevant_objects_section failed!");
 			}
 		}
 
@@ -1178,6 +1245,18 @@ namespace Crash
 				trim(value);
 
 				a_log.critical("\t\t{}: {}", key, value);
+			}
+		}
+
+		void print_settings_safeguard(spdlog::logger& a_log)
+		{
+			__try
+			{
+				print_settings(a_log);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_settings failed!");
 			}
 		}
 
@@ -1300,8 +1379,20 @@ namespace Crash
 			}
 
 			// Detect VM
-			if (VM::detect(VM::DISABLE(VM::GAMARUE)))
-				a_log.critical("\tDetected Virtual Machine: {} ({}%)"sv, VM::brand(VM::MULTIPLE), VM::percentage());
+			/*if (VM::detect(VM::DISABLE(VM::GAMARUE)))
+				a_log.critical("\tDetected Virtual Machine: {} ({}%)"sv, VM::brand(VM::MULTIPLE), VM::percentage());*/
+		}
+
+		void print_sysinfo_safeguard(spdlog::logger& a_log)
+		{
+			__try
+			{
+				print_sysinfo(a_log);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_sysinfo failed!");
+			}
 		}
 
 		void print_process_info(spdlog::logger& a_log)
@@ -1422,6 +1513,18 @@ namespace Crash
 			}
 		}
 
+		void print_process_info_safeguard(spdlog::logger& a_log)
+		{
+			__try
+			{
+				print_process_info(a_log);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_process_info failed!");
+			}
+		}
+
 		bool contains_case_insensitive(std::string_view haystack, std::string_view needle)
 		{
 			if (needle.empty())
@@ -1502,6 +1605,18 @@ namespace Crash
 				joined += indicators[i];
 			}
 			a_log.critical("\tLikely Role: {}"sv, joined);
+		}
+
+		void print_thread_context_safeguard(spdlog::logger& a_log, const Callstack* a_callstack, std::span<const module_pointer> a_modules)
+		{
+			__try
+			{
+				print_thread_context(a_log, a_callstack, a_modules);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_thread_context failed!");
+			}
 		}
 
 #undef SETTING_CASE
@@ -1608,7 +1723,7 @@ namespace Crash
 					// Callstack construction failed, continue without it
 				}
 
-				print([&]() { print_exception(*log, *a_exception->ExceptionRecord, cmodules, throwLocation, a_exception->ContextRecord); }, "print_exception");
+				print([&]() { print_exception_safeguard(*log, *a_exception->ExceptionRecord, cmodules, throwLocation, a_exception->ContextRecord); }, "print_exception");
 
 				// Reset introspection state once per crash (before all analysis)
 				Introspection::reset_analysis_state();
@@ -1651,13 +1766,13 @@ namespace Crash
 				}
 
 				// Print relevant objects section (after exception, before other sections)
-				print([&]() { print_relevant_objects_section(*log, relevantObjects); }, "print_relevant_objects");
+				print([&]() { print_relevant_objects_section_safeguard(*log, relevantObjects); }, "print_relevant_objects");
 
-				print([&]() { print_process_info(*log); }, "print_process_info");
-				print([&]() { print_thread_context(*log, callstack ? &(*callstack) : nullptr, cmodules); }, "print_thread_context");
+				print([&]() { print_process_info_safeguard(*log); }, "print_process_info");
+				print([&]() { print_thread_context_safeguard(*log, callstack ? &(*callstack) : nullptr, cmodules); }, "print_thread_context");
 				if (Settings::bPrintSettings.GetValue())
-					print([&]() { print_settings(*log); }, "print_sysinfo");
-				print([&]() { print_sysinfo(*log); }, "print_sysinfo");
+					print([&]() { print_settings_safeguard(*log); }, "print_sysinfo");
+				print([&]() { print_sysinfo_safeguard(*log); }, "print_sysinfo");
 				/*if (REL::Module::IsVR())
 					print([&]() { print_vrinfo(*log); }, "print_vrinfo");*/
 
@@ -1680,7 +1795,7 @@ namespace Crash
 						}
 
 						const auto probable_frames = callstack_ptr->get_frame_addresses();
-						print_hybrid_callstack(*log, probable_frames, *stack_opt, cmodules);
+						print_hybrid_callstack_safeguard(*log, probable_frames, *stack_opt, cmodules);
 					}
 					catch (const std::bad_alloc&)
 					{
@@ -1750,18 +1865,18 @@ namespace Crash
 					}
 
 					// Print with pre-analyzed data
-					print([&]() { print_registers(*log, *a_exception->ContextRecord, cmodules, finalRegAnalysis); }, "print_registers");
-					print([&]() { print_stack(*log, *a_exception->ContextRecord, cmodules, stackAnalyses); }, "print_raw_stack");
+					print([&]() { print_registers_safeguard(*log, *a_exception->ContextRecord, cmodules, finalRegAnalysis); }, "print_registers");
+					print([&]() { print_stack_safeguard(*log, *a_exception->ContextRecord, cmodules, stackAnalyses); }, "print_raw_stack");
 				}
 				catch (...)
 				{
 					// Fallback to original behavior if analysis fails
-					print([&]() { print_registers(*log, *a_exception->ContextRecord, cmodules); }, "print_registers");
-					print([&]() { print_stack(*log, *a_exception->ContextRecord, cmodules); }, "print_raw_stack");
+					print([&]() { print_registers_safeguard(*log, *a_exception->ContextRecord, cmodules); }, "print_registers");
+					print([&]() { print_stack_safeguard(*log, *a_exception->ContextRecord, cmodules); }, "print_raw_stack");
 				}
-				print([&]() { print_modules(*log, cmodules); }, "print_modules");
-				print([&]() { print_xse_plugins(*log, cmodules); }, "print_xse_plugins");
-				print([&]() { print_plugins(*log); }, "print_plugins");
+				print([&]() { print_modules_safeguard(*log, cmodules); }, "print_modules");
+				print([&]() { print_xse_plugins_safeguard(*log, cmodules); }, "print_xse_plugins");
+				print([&]() { print_plugins_safeguard(*log); }, "print_plugins");
 
 				// Ensure all log data is written to disk before we try to open the file
 				log->flush();

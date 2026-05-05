@@ -45,8 +45,19 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		const std::vector<std::string>& pre_analyzed);
 
+	void print_registers_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules,
+		const std::vector<std::string>& pre_analyzed);
+
 	// Print registers with on-the-fly analysis
 	void print_registers(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules);
+
+	void print_registers_safeguard(
 		spdlog::logger& a_log,
 		const ::CONTEXT& a_context,
 		std::span<const module_pointer> a_modules);
@@ -58,8 +69,19 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		const std::vector<std::vector<std::string>>& pre_analyzed_blocks);
 
+	void print_stack_safeguard(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules,
+		const std::vector<std::vector<std::string>>& pre_analyzed_blocks);
+
 	// Print stack with on-the-fly analysis
 	void print_stack(
+		spdlog::logger& a_log,
+		const ::CONTEXT& a_context,
+		std::span<const module_pointer> a_modules);
+
+	void print_stack_safeguard(
 		spdlog::logger& a_log,
 		const ::CONTEXT& a_context,
 		std::span<const module_pointer> a_modules);
@@ -142,6 +164,14 @@ namespace Crash
 
 	// Print a hybrid callstack (probable frames + stack scan)
 	void print_hybrid_callstack(
+		spdlog::logger& a_log,
+		std::span<const void* const> a_probable_frames,
+		std::span<const std::size_t> a_stack,
+		std::span<const module_pointer> a_modules,
+		std::size_t a_max_total_frames = 128,
+		std::size_t a_max_inserted_frames = 64);
+
+	void print_hybrid_callstack_safeguard(
 		spdlog::logger& a_log,
 		std::span<const void* const> a_probable_frames,
 		std::span<const std::size_t> a_stack,

@@ -72,7 +72,7 @@ target(plugin_name)
     add_links("winhttp")
 
     -- add vmaware
-    add_includedirs("lib/vmaware/src")
+    -- add_includedirs("lib/vmaware/src")
 
     -- add commonlibsse plugin
     add_rules("commonlibf4.plugin", {
