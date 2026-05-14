@@ -41,6 +41,12 @@ namespace Main
 
             REX::INFO("Addictol's Crash Logger Initializing...");
 
+            // AddictolCrashLogger.log is not a Crash Log
+            REX::INFO("============================================");
+            REX::INFO("!!!! ---- This is NOT a Crash Log ---- !!!!");
+            REX::INFO("Look for crash-YYYY-MM-DD-HH-MM-SS.log files");
+            REX::INFO("============================================");
+
             // Load the Config
             const auto config = REX::TOML::SettingStore::GetSingleton();
             config->Init("Data/F4SE/Plugins/AddictolCrashLogger.toml", "Data/F4SE/Plugins/AddictolCrashLoggerCustom.toml");
