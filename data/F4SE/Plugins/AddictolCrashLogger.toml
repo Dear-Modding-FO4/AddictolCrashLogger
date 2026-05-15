@@ -4,54 +4,54 @@
 
 # Master toggle for the Crash Logger.
 # If disabled, no crash logs or minidumps will be generated.
-bEnableCrashLogger=true
+bEnableCrashLogger = true
 
 # If enabled, Addictol's settings will be printed in crash logs.
-bPrintSettings=true
+bPrintSettings = true
 
 # Maximum number of crash logs to keep.
-iMaxCrashLogs=20
+iMaxCrashLogs = 20
 
 # Maximum number of minidumps to keep.
-iMaxMiniDumps=1
+iMaxMiniDumps = 1
 
 
 [Directories]
 
 # Directory where crash logs and minidumps are stored.
 # If empty: %USERPROFILE%\Documents\My Games\Fallout4\F4SE
-sCrashLogDirectory=""
+sCrashLogDirectory = ""
 
 # Directory for symbol cache storage.
-sSymcacheDirectory="C:\\symcache"
+sSymcacheDirectory = "C:\\symcache"
 
 
 [Debugging]
 
 # If enabled, waits for a debugger to attach when a crash occurs.
-bWaitForDebugger=false
+bWaitForDebugger = false
 
 # If enabled, minidumps will include full memory.
 # Warning: This can produce a very large minidump.
-bFullMemoryMiniDump=false
+bFullMemoryMiniDump = false
 
 # If enabled, minidumps will be written alongside crash logs.
-bCrashLogWriteMiniDump=false
+bCrashLogWriteMiniDump = false
 
 # If enabled, minidumps will be written alongside thread dumps.
-bThreadDumpWriteMiniDump=false
+bThreadDumpWriteMiniDump = false
 
 # If enabled, performs heap allocation analysis for crash pointers.
-bHeapAnalysis=false
+bHeapAnalysis = false
 
 # Maximum number of heaps to check.
-iMaxHeapsToCheck=1
+iMaxHeapsToCheck = 1
 
 # Maximum allocations to check per heap before stopping.
-iMaxHeapIterationsPerHeap=1000
+iMaxHeapIterationsPerHeap = 1000
 
 
 [Hotkeys]
 
 # If enabled, Ctrl + Shift + F12 will trigger a manual thread dump.
-bEnableThreadDumpHotkey=false
+bEnableThreadDumpHotkey = false
