@@ -4,7 +4,6 @@
 .vs/
 .vscode/
 .xmake/
-.clangd
 
 # folders
 build*/
@@ -13,3 +12,4 @@ vs*/
 # files
 *.zip
 compile_commands.json
+.clangd
