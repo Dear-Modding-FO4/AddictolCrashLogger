@@ -3,27 +3,6 @@
 // Patches
 #include <CrashHandler.h>
 
-#define MAKE_EXE_VERSION_EX(major, minor, build, sub)	((((major) & 0xFF) << 24) | (((minor) & 0xFF) << 16) | (((build) & 0xFFF) << 4) | ((sub) & 0xF))
-#define MAKE_EXE_VERSION(major, minor, build)			MAKE_EXE_VERSION_EX(major, minor, build, 0)
-
-namespace OGSupport
-{
-    static F4SE::Impl::F4SEInterface RestoreLoadInterface;
-
-    [[nodiscard]] inline static const char* F4SEAPI F4SEGetSaveFolderName() noexcept
-    {
-        return "Fallout4";
-    }
-
-    void Init(const F4SE::LoadInterface* a_f4se)
-    {
-        memcpy(&RestoreLoadInterface, a_f4se, 48);
-        (((F4SE::Impl::F4SEInterface*)(&RestoreLoadInterface))->GetSaveFolderName) = F4SEGetSaveFolderName;
-        
-        F4SE::Init((const F4SE::LoadInterface*)(&RestoreLoadInterface));
-    }
-}
-
 namespace Main
 {
     // Init Bool
@@ -36,9 +15,10 @@ namespace Main
 
         static std::once_flag once;
         std::call_once(once, [&]() {
-            // Init F4SE (OG Support)
-            OGSupport::Init(a_f4se);
+            // Init F4SE
+            F4SE::Init(a_f4se);
 
+            // Init Mod
             REX::INFO("Addictol's Crash Logger Initializing...");
 
             // AddictolCrashLogger.log is not a Crash Log
@@ -56,18 +36,12 @@ namespace Main
             if (Settings::bEnableCrashLogger.GetValue() == true)
             {
                 if (Crash::Install())
-                {
                     REX::INFO("Addictol's Crash Logger Initialized!");
-                }
                 else
-                {
                     REX::INFO("Addictol's Crash Logger Initialization failed!");
-                }
             }
             else
-            {
                 REX::INFO("Addictol's Crash Logger is disabled.");
-            }
 
             // Finished
             isInit = true;
@@ -76,23 +50,21 @@ namespace Main
         return isInit;
     }
 
-    F4SE_EXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a_f4se, F4SE::PluginInfo* a_info)
+    F4SE_PLUGIN_QUERY(const F4SE::QueryInterface* a_f4se, F4SE::PluginInfo* a_info)
     {
-        if (!a_f4se)
+        if (const auto data = F4SE::PluginVersionData::GetSingleton())
+        {
+            a_info->infoVersion = F4SE::PluginInfo::kVersion;
+            a_info->name = data->GetPluginName().data();
+            a_info->version = data->GetPluginVersion().pack();
+        }
+
+        const auto ver = a_f4se->RuntimeVersion();
+        if (ver < REL::Version(F4SE::RUNTIME_1_10_163))
             return false;
 
-        if (!a_info)
-            return false;
-
-        if (a_f4se->RuntimeVersion() != REL::Version{ 1, 10, 163, 0 })
-            return false;
-
-        a_info->infoVersion = F4SE::PluginInfo::kVersion;
-        a_info->version = MAKE_EXE_VERSION(PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH);
-        a_info->name = PLUGIN_NAME;
-
-		return true;
-	}
+        return true;
+    }
 
     F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 	{

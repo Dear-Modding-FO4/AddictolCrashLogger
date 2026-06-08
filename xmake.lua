@@ -3,7 +3,7 @@ includes("lib/commonlibf4")
 
 -- name and version
 local plugin_name = "AddictolCrashLogger"
-local plugin_version = "1.3.0"
+local plugin_version = "1.4.0"
 local plugin_version_major, plugin_version_minor, plugin_version_patch = plugin_version:match("^(%d+)%.(%d+)%.(%d+)$")
 
 -- set project constants
@@ -78,8 +78,7 @@ target(plugin_name)
     add_rules("commonlibf4.plugin", {
         name = plugin_name,
         author = "DearModdingFO4",
-        description = "Addictol's Crash Logger",
-        plugin_template = path.join("res/commonlibf4-plugin.cpp.in")
+        description = "Addictol's Crash Logger"
     })
 
     -- add src files
