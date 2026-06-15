@@ -334,7 +334,7 @@ namespace Crash
 			}
 
 			RE::ConsoleLog::GetSingleton()->PrintLine(message.c_str());
-			REX::INFO("{}", message);
+			LOG::INFO("{}", message);
 
 			// Auto-open thread dump log if enabled
 			auto_open_log(logPath);
@@ -342,11 +342,11 @@ namespace Crash
 		}
 		catch (const std::exception& e)
 		{
-			REX::ERROR("Failed to write thread dump: {}"sv, e.what());
+			LOG::ERROR("Failed to write thread dump: {}"sv, e.what());
 		}
 		catch (...)
 		{
-			REX::ERROR("Failed to write thread dump: unknown error"sv);
+			LOG::ERROR("Failed to write thread dump: unknown error"sv);
 		}
 	}
 
@@ -378,7 +378,7 @@ namespace Crash
 				}
 				catch (...)
 				{
-					REX::ERROR("Failed to write thread dump"sv);
+					LOG::ERROR("Failed to write thread dump"sv);
 				}
 			}
 			else if (!allPressed)

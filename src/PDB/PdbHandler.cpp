@@ -334,9 +334,9 @@ namespace Crash
 			}
 
 			if (a_result.empty())
-				REX::INFO("No symbol found for {}+{:07X}"sv, a_name, a_offset);
+				LOG::INFO("No symbol found for {}+{:07X}"sv, a_name, a_offset);
 			else
-				REX::INFO("Symbol returning: {}", a_result);
+				LOG::INFO("Symbol returning: {}", a_result);
 
 			return a_result;
 		}
@@ -592,7 +592,7 @@ namespace Crash
 				if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
 				{
 					auto error = print_hr_failure(hr);
-					REX::INFO("Failed to initialize COM library for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					LOG::INFO("Failed to initialize COM library for dll {}+{:07X}\t{}", a_name, a_offset, error);
 					return false;
 				}
 				com_initialized_here = SUCCEEDED(hr);
@@ -603,13 +603,13 @@ namespace Crash
 				if (FAILED(hr))
 				{
 					auto error = print_hr_failure(hr);
-					REX::INFO("Failed to manually load msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					LOG::INFO("Failed to manually load msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
 
 					// Try registered copy
 					if (FAILED(hr = CoCreateInstance(CLSID_DiaSource, NULL, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void**)&pSource)))
 					{
 						auto error = print_hr_failure(hr);
-						REX::INFO("Failed to load registered msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
+						LOG::INFO("Failed to load registered msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
 						return false;
 					}
 				}
@@ -629,11 +629,11 @@ namespace Crash
 				{
 					if (!symcache.empty() && std::filesystem::exists(symcache) && std::filesystem::is_directory(symcache))
 					{
-						REX::INFO("Symcache found at {}", symcache);
+						LOG::INFO("Symcache found at {}", symcache);
 						symcacheValid.store(true, std::memory_order_release);
 					}
 					else
-						REX::INFO("Symcache not found at {}", symcache.empty() ? "not defined" : symcache);
+						LOG::INFO("Symcache not found at {}", symcache.empty() ? "not defined" : symcache);
 
 					symcacheChecked.store(true, std::memory_order_release);
 				}
@@ -651,12 +651,12 @@ namespace Crash
 					wcsncpy(wszPath, path_w.c_str(), sizeof(wszPath) / sizeof(wchar_t));
 					wszPath[_MAX_PATH - 1] = L'\0';
 
-					REX::INFO("Attempting to find pdb for {}+{:07X} with path {}", a_name, a_offset, path);
+					LOG::INFO("Attempting to find pdb for {}+{:07X} with path {}", a_name, a_offset, path);
 					hr = pSource->loadDataForExe(wszFilename, wszPath, NULL);
 					if (FAILED(hr))
 					{
 						auto error = print_hr_failure(hr);
-						REX::INFO("Failed to open pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+						LOG::INFO("Failed to open pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
 						continue;
 					}
 					foundPDB = true;
@@ -666,13 +666,13 @@ namespace Crash
 				if (!foundPDB)
 					return false;
 
-				REX::INFO("Successfully opened pdb for dll {}+{:07X}", a_name, a_offset);
+				LOG::INFO("Successfully opened pdb for dll {}+{:07X}", a_name, a_offset);
 
 				// Open session
 				if (FAILED(hr = pSource->openSession(&pSession)))
 				{
 					auto error = print_hr_failure(hr);
-					REX::INFO("Failed to openSession for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					LOG::INFO("Failed to openSession for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
 					return false;
 				}
 
@@ -680,7 +680,7 @@ namespace Crash
 				if (FAILED(hr = pSession->get_globalScope(&globalSymbol)))
 				{
 					auto error = print_hr_failure(hr);
-					REX::INFO("Failed to get_globalScope for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					LOG::INFO("Failed to get_globalScope for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
 					return false;
 				}
 
@@ -709,14 +709,14 @@ namespace Crash
 			if (FAILED(hr = session.pSession->getEnumTables(&enumTables)))
 			{
 				auto error = print_hr_failure(hr);
-				REX::INFO("Failed to getEnumTables for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+				LOG::INFO("Failed to getEnumTables for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
 				return result;
 			}
 
 			if (FAILED(hr = session.pSession->getSymbolsByAddr(&enumSymbolsByAddr)))
 			{
 				auto error = print_hr_failure(hr);
-				REX::INFO("Failed to getSymbolsByAddr for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+				LOG::INFO("Failed to getSymbolsByAddr for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
 				return result;
 			}
 
@@ -726,7 +726,7 @@ namespace Crash
 				auto publicResult = processSymbol(publicSymbol, session.pSession, rva, a_name, a_offset, result);
 
 				// Log the public result (already demangled in processSymbol)
-				REX::INFO("Public symbol found for {}+{:07X}: {}", a_name, a_offset, publicResult);
+				LOG::INFO("Public symbol found for {}+{:07X}: {}", a_name, a_offset, publicResult);
 
 				DWORD privateRva;
 				CComPtr<IDiaSymbol> privateSymbol;
@@ -736,7 +736,7 @@ namespace Crash
 					auto privateResult = processSymbol(privateSymbol, session.pSession, privateRva, a_name, a_offset, result);
 
 					// Log the private result (already demangled in processSymbol)
-					REX::INFO("Private symbol found for {}+{:07X}: {}", a_name, a_offset, privateResult);
+					LOG::INFO("Private symbol found for {}+{:07X}: {}", a_name, a_offset, privateResult);
 
 					// Combine results
 					if (!privateResult.empty() && !publicResult.empty())
@@ -750,7 +750,7 @@ namespace Crash
 					result = publicResult;
 			}
 			else
-				REX::INFO("No public symbol found for {}+{:07X}", a_name, a_offset);
+				LOG::INFO("No public symbol found for {}+{:07X}", a_name, a_offset);
 
 			return result;
 		}
@@ -848,7 +848,7 @@ namespace Crash
 			// RPC_E_CHANGED_MODE means COM is already initialized with different threading mode
 			if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE)
 			{
-				REX::ERROR("Failed to initialize COM for symbol dumping: {}", print_hr_failure(com_hr));
+				LOG::ERROR("Failed to initialize COM for symbol dumping: {}", print_hr_failure(com_hr));
 				return;
 			}
 			int retflag;
@@ -879,7 +879,7 @@ namespace Crash
 		{
 			retflag = 1;
 			const auto filename = std::make_optional(path.filename().string());
-			REX::INFO("Found dll {}", *filename);
+			LOG::INFO("Found dll {}", *filename);
 			auto dll_path = path.string();
 			auto search_path = Crash::PDB::sPluginPath.data();
 			CComPtr<IDiaDataSource> source;
@@ -905,7 +905,7 @@ namespace Crash
 					retflag = 3;
 					return;
 				};
-				REX::INFO("Found pdb for dll {}", *filename);
+				LOG::INFO("Found pdb for dll {}", *filename);
 			}
 
 			CComPtr<IDiaSession> pSession;
@@ -940,7 +940,7 @@ namespace Crash
 				uintptr_t a_offset = 0;
 				std::string result = "";
 				result = processSymbol(pSymbol, pSession, rva, a_name, a_offset, result);
-				REX::INFO("{}", result);
+				LOG::INFO("{}", result);
 				pSymbol->Release();
 				if (FAILED(pEnumSymbolsByAddr->Next(1, &pSymbol, &celt)))
 				{

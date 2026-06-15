@@ -1044,10 +1044,10 @@ namespace Crash::Introspection
 						const char* mangled_name = base->typeDescriptor->raw_name();
 						if (mangled_name && mangled_name[0] != '\0') {
 							std::string demangled_info = Crash::PDB::demangle(std::string(mangled_name));
-							REX::INFO("Found unhandled type:\t{}\t{} [{}]"sv, result, mangled_name, demangled_info);
+							LOG::INFO("Found unhandled type:\t{}\t{} [{}]"sv, result, mangled_name, demangled_info);
 						}
 						else
-							REX::INFO("Found unhandled type:\t{}\t<null>"sv, result);
+							LOG::INFO("Found unhandled type:\t{}\t<null>"sv, result);
 					}
 				}
 
@@ -1420,7 +1420,7 @@ void Crash::Introspection::backfill_void_pointers(std::vector<std::string>& a_re
 	// Log the backfill statistics (only once per crash)
 	if (!detail::backfill_logged_this_crash && detail::total_backfill_count > 0)
 	{
-		REX::INFO("Backfilled {} void* pointers with known object information across all analysis", detail::total_backfill_count);
+		LOG::INFO("Backfilled {} void* pointers with known object information across all analysis", detail::total_backfill_count);
 		detail::backfill_logged_this_crash = true;
 	}
 }

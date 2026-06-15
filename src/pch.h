@@ -8,6 +8,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#define NOGDI
 
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -27,9 +28,61 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/msvc_sink.h>
+
 #undef GetObject  // Have to do this because PCH pulls in spdlog->winbase.h->windows.h->wingdi.h, which redfines GetObject
 
 using namespace std::literals;
+
+// Logging
+#define AD_NOMESSAGE_CRASHLOGGER 1
+
+namespace LOG
+{
+    template <class... T>
+    inline void INFO(const std::format_string<T...> fmt, T&&... args)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::INFO<T...>{ fmt, std::forward<T>(args)... };
+#endif
+    }
+
+    inline void INFO(std::string_view fmt)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::INFO<void>{ fmt };
+#endif
+    }
+
+    template <class... T>
+    inline void WARN(const std::format_string<T...> fmt, T&&... args)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::WARN<T...>{ fmt, std::forward<T>(args)... };
+#endif
+    }
+
+    inline void WARN(std::string_view fmt)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::WARN<void>{ fmt };
+#endif
+    }
+
+	template <class... T>
+    inline void ERROR(const std::format_string<T...> fmt, T&&... args)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::ERROR<T...>{ fmt, std::forward<T>(args)... };
+#endif
+    }
+
+    inline void ERROR(std::string_view fmt)
+    {
+#if !AD_NOMESSAGE_CRASHLOGGER
+        REX::ERROR<void>{ fmt };
+#endif
+    }
+}
 
 namespace util
 {

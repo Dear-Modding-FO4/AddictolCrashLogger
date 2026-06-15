@@ -1184,14 +1184,14 @@ namespace Crash
 		
 			if (!std::filesystem::exists(ConfigFile))
 			{
-				REX::WARN("Config File was not found at: {}", ConfigFile.string());
+				LOG::WARN("Config File was not found at: {}", ConfigFile.string());
 				return;
 			}
 
 			std::ifstream file(ConfigFile);
 			if (!file.is_open())
 			{
-				REX::WARN("Failed to open the Config File at: {}", ConfigFile.string());
+				LOG::WARN("Failed to open the Config File at: {}", ConfigFile.string());
 				return;
 			}
 
@@ -1973,8 +1973,7 @@ namespace Crash
 				}
 				catch (...)
 				{
-					//REX::ERROR("Failed to upload crash log");
-					REX::WARN("Failed to upload crash log");
+					LOG::ERROR("Failed to upload crash log");
 				}
 			}
 

@@ -49,25 +49,25 @@ namespace Crash
 			// Ensure file exists before trying to open
 			if (std::filesystem::exists(logPath))
 			{
-				REX::INFO("Attempting to auto-open log: {}", logPath.string());
+				LOG::INFO("Attempting to auto-open log: {}", logPath.string());
 				const std::wstring logPathW = logPath.wstring();
 				const auto result = ShellExecuteW(nullptr, L"open", logPathW.c_str(), nullptr, nullptr, SW_SHOW);
 				// ShellExecute returns a value <= 32 if it fails
 				if (reinterpret_cast<INT_PTR>(result) <= 32)
 				{
-					REX::WARN("Failed to auto-open log with default handler (error: {}), trying notepad fallback", static_cast<int>(reinterpret_cast<INT_PTR>(result)));
+					LOG::WARN("Failed to auto-open log with default handler (error: {}), trying notepad fallback", static_cast<int>(reinterpret_cast<INT_PTR>(result)));
 					// Fallback: try opening with notepad explicitly
 					const auto fallbackResult = ShellExecuteW(nullptr, L"open", L"notepad.exe", logPathW.c_str(), nullptr, SW_SHOW);
 					if (reinterpret_cast<INT_PTR>(fallbackResult) <= 32)
-						REX::ERROR("Failed to auto-open log with notepad fallback (error: {})", static_cast<int>(reinterpret_cast<INT_PTR>(fallbackResult)));
+						LOG::ERROR("Failed to auto-open log with notepad fallback (error: {})", static_cast<int>(reinterpret_cast<INT_PTR>(fallbackResult)));
 					else
-						REX::INFO("Successfully auto-opened log with notepad");
+						LOG::INFO("Successfully auto-opened log with notepad");
 				}
 				else
-					REX::INFO("Successfully auto-opened log with default handler");
+					LOG::INFO("Successfully auto-opened log with default handler");
 			}
 			else
-				REX::WARN("Log file does not exist, cannot auto-open: {}", logPath.string());
+				LOG::WARN("Log file does not exist, cannot auto-open: {}", logPath.string());
 		}
 	}
 
@@ -146,7 +146,7 @@ namespace Crash
 				const auto& file = files[i];
 
 				std::filesystem::remove(file.path);
-				REX::INFO("Cleaned up old file: {}", file.path.filename().string());
+				LOG::INFO("Cleaned up old file: {}", file.path.filename().string());
 
 				// Try to delete associated file if requested
 				if (!associated_extension.empty())
@@ -156,7 +156,7 @@ namespace Crash
 					if (std::filesystem::exists(assocPath))
 					{
 						std::filesystem::remove(assocPath);
-						REX::INFO("Cleaned up associated file: {}", assocPath.filename().string());
+						LOG::INFO("Cleaned up associated file: {}", assocPath.filename().string());
 					}
 				}
 			}
@@ -164,7 +164,7 @@ namespace Crash
 		}
 		catch (const std::exception& e)
 		{
-			REX::ERROR("Failed to clean old files: {}", e.what());
+			LOG::ERROR("Failed to clean old files: {}", e.what());
 		}
 	}
 
@@ -237,7 +237,7 @@ namespace Crash
 			// Get API key from settings
 			if (Settings::sPastebinAPIKey.GetValue().empty())
 			{
-				REX::ERROR("Pastebin API key not configured. Get one from https://pastebin.com/doc_api#1");
+				LOG::ERROR("Pastebin API key not configured. Get one from https://pastebin.com/doc_api#1");
 				return ""s;
 			}
 
@@ -245,7 +245,7 @@ namespace Crash
 			std::ifstream logFile(logPath);
 			if (!logFile.is_open())
 			{
-				REX::ERROR("Failed to open log file for upload: {}", logPath.string());
+				LOG::ERROR("Failed to open log file for upload: {}", logPath.string());
 				return ""s;
 			}
 
@@ -256,7 +256,7 @@ namespace Crash
 			// Check size limit (512KB for pastebin.com)
 			if (logContent.size() > 512 * 1024)
 			{
-				REX::WARN("Log file too large for pastebin.com ({}bytes), truncating", logContent.size());
+				LOG::WARN("Log file too large for pastebin.com ({}bytes), truncating", logContent.size());
 				logContent = logContent.substr(0, 512 * 1024);
 				logContent += "\n\n[LOG TRUNCATED - File too large for pastebin.com]";
 			}
@@ -278,7 +278,7 @@ namespace Crash
 
 			if (!hSession)
 			{
-				REX::ERROR("WinHttpOpen failed");
+				LOG::ERROR("WinHttpOpen failed");
 				return ""s;
 			}
 
@@ -291,7 +291,7 @@ namespace Crash
 
 			if (!hConnect)
 			{
-				REX::ERROR("WinHttpConnect failed");
+				LOG::ERROR("WinHttpConnect failed");
 				WinHttpCloseHandle(hSession);
 				return ""s;
 			}
@@ -308,7 +308,7 @@ namespace Crash
 
 			if (!hRequest)
 			{
-				REX::ERROR("WinHttpOpenRequest failed");
+				LOG::ERROR("WinHttpOpenRequest failed");
 				WinHttpCloseHandle(hConnect);
 				WinHttpCloseHandle(hSession);
 				return ""s;
@@ -334,7 +334,7 @@ namespace Crash
 
 			if (!result)
 			{
-				REX::ERROR("WinHttpSendRequest failed: {}", GetLastError());
+				LOG::ERROR("WinHttpSendRequest failed: {}", GetLastError());
 				WinHttpCloseHandle(hRequest);
 				WinHttpCloseHandle(hConnect);
 				WinHttpCloseHandle(hSession);
@@ -345,7 +345,7 @@ namespace Crash
 			result = WinHttpReceiveResponse(hRequest, nullptr);
 			if (!result)
 			{
-				REX::ERROR("WinHttpReceiveResponse failed");
+				LOG::ERROR("WinHttpReceiveResponse failed");
 				WinHttpCloseHandle(hRequest);
 				WinHttpCloseHandle(hConnect);
 				WinHttpCloseHandle(hSession);
@@ -382,7 +382,7 @@ namespace Crash
 			// or an error message starting with "Bad API request"
 			if (response.find("Bad API request") != std::string::npos || response.find("error") != std::string::npos)
 			{
-				REX::ERROR("Pastebin API error: {}", response);
+				LOG::ERROR("Pastebin API error: {}", response);
 				return ""s;
 			}
 
@@ -394,37 +394,37 @@ namespace Crash
 
 			if (pasteUrl.empty() || pasteUrl.find("http") != 0)
 			{
-				REX::ERROR("Invalid response from pastebin: {}", response);
+				LOG::ERROR("Invalid response from pastebin: {}", response);
 				return ""s;
 			}
 
-			REX::INFO("Crash log uploaded to: {}", pasteUrl);
+			LOG::INFO("Crash log uploaded to: {}", pasteUrl);
 
 			// Copy to clipboard
 			if (copy_to_clipboard(pasteUrl))
-				REX::INFO("Paste URL copied to clipboard");
+				LOG::INFO("Paste URL copied to clipboard");
 			else
-				REX::WARN("Failed to copy URL to clipboard");
+				LOG::WARN("Failed to copy URL to clipboard");
 
 			// Auto-open in browser
 			const std::wstring pasteUrlW = std::wstring(pasteUrl.begin(), pasteUrl.end());
 			const auto shellResult = ShellExecuteW(nullptr, L"open", pasteUrlW.c_str(), nullptr, nullptr, SW_SHOW);
 			if (reinterpret_cast<INT_PTR>(shellResult) > 32)
-				REX::INFO("Opened paste URL in browser");
+				LOG::INFO("Opened paste URL in browser");
 			else
-				REX::WARN("Failed to open URL in browser (error: {})", static_cast<int>(reinterpret_cast<INT_PTR>(shellResult)));
+				LOG::WARN("Failed to open URL in browser (error: {})", static_cast<int>(reinterpret_cast<INT_PTR>(shellResult)));
 
 			return pasteUrl;
 
 		}
 		catch (const std::exception& e)
 		{
-			REX::ERROR("Exception during log upload: {}", e.what());
+			LOG::ERROR("Exception during log upload: {}", e.what());
 			return ""s;
 		}
 		catch (...)
 		{
-			REX::ERROR("Unknown exception during log upload");
+			LOG::ERROR("Unknown exception during log upload");
 			return ""s;
 		}
 	}
