@@ -12,6 +12,7 @@
 #include <Zydis/Zydis.h>
 //#include <vmaware.hpp>
 #include <wincrypt.h>
+#include <atomic>
 
 namespace Crash
 {
@@ -1988,9 +1989,33 @@ namespace Crash
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
-		std::int32_t _stdcall VectoredExceptions(::EXCEPTION_POINTERS*) noexcept
+		std::int32_t _stdcall VectoredExceptions(::EXCEPTION_POINTERS* a_exception) noexcept
 		{
+			// Keep our top-level filter installed (defends against other plugins / ENB overwriting SetUnhandledExceptionFilter).
 			::SetUnhandledExceptionFilter(reinterpret_cast<::LPTOP_LEVEL_EXCEPTION_FILTER>(&UnhandledExceptions));
+
+			// __fastfail and /GS-cookie failures bypass SetUnhandledExceptionFilter; VEH catches them.
+			// Guard prevents re-entry if logging itself trips a fast-fail.
+			if (a_exception && a_exception->ExceptionRecord)
+			{
+				switch (a_exception->ExceptionRecord->ExceptionCode)
+				{
+				case 0xC0000409:  // STATUS_STACK_BUFFER_OVERRUN (__fastfail, /GS, abort)
+				case 0xC0000602:  // STATUS_FAIL_FAST_EXCEPTION
+					{
+						static std::atomic_bool handling{ false };
+						bool expected = false;
+						
+						if (handling.compare_exchange_strong(expected, true))
+							UnhandledExceptions(a_exception);  // logs + TerminateProcess; never returns
+						
+						break;
+					}
+				default:
+					break;
+				}
+			}
+
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 	}  // namespace
