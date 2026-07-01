@@ -456,44 +456,64 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::TESObjectREFR;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto ref = static_cast<const value_type*>(a_ptr);
 
-			try {
+			// Object Reference
+			try
+			{
 				const auto objRef = ref->data.objectReference;
-				if (objRef) {
+				if (objRef)
+				{
 					filter_results xResults;
-					TESForm<RE::TESForm>::filter(xResults, objRef);
+					TESForm<RE::TESForm>::filter(xResults, objRef, tab_depth);
 
-					if (!xResults.empty()) {
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}Object Reference"sv,
-								"",
-								tab_depth),
-							"");
-						for (auto& [key, value] : xResults) {
-							a_results.emplace_back(
-								fmt::format(
-									"{:\t>{}}{}"sv,
-									"",
-									tab_depth,
-									key),
-								std::move(value));
+					if (!xResults.empty())
+					{
+						a_results.emplace_back(fmt::format("{:\t>{}}Object Reference"sv, "", tab_depth), "");
+						for (auto& [key, value] : xResults)
+						{
+							a_results.emplace_back(fmt::format("{:\t>{}}{}"sv, "", tab_depth, key), std::move(value));
 						}
 					}
 				}
-				else {
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Object Reference"sv,
-							""sv,
-							tab_depth),
-						"None"sv);
+				else
+					a_results.emplace_back(fmt::format("{:\t>{}}Object Reference"sv, ""sv, tab_depth), "None"sv);
+			}
+			catch (...) {}
+
+			// Leveled Base Form
+			try
+			{
+				RE::ExtraLeveledCreature* leveledCreature = ref->extraList->GetByType<RE::ExtraLeveledCreature>();
+				if (leveledCreature && leveledCreature->originalBase)
+				{
+					filter_results xResults;
+					TESForm<RE::TESForm>::filter(xResults, leveledCreature->originalBase, tab_depth + 1);
+
+					if (!xResults.empty())
+					{
+						a_results.emplace_back(fmt::format("{:\t>{}}Leveled Base Form"sv, "", tab_depth), "");
+						for (auto& [key, value] : xResults)
+						{
+							a_results.emplace_back(fmt::format("{:\t>{}}{}"sv, "", tab_depth, key), std::move(value));
+						}
+					}
 				}
+			}
+			catch (...) {}
+
+			// Parent Cell
+			try {
+				const auto parentCell = ref->GetParentCell();
+				if (parentCell)
+				{
+					a_results.emplace_back(fmt::format("{:\t>{}}Parent Cell"sv, "", tab_depth), "");
+					TESForm<RE::TESObjectCELL>::filter(a_results, parentCell, tab_depth + 1);
+				}
+				else
+					a_results.emplace_back(fmt::format("{:\t>{}}Parent Cell"sv, "", tab_depth), "None");
 			}
 			catch (...) {}
 		}
