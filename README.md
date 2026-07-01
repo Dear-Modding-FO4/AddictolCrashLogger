@@ -1,7 +1,7 @@
 # Addictol Crash Logger
 
-Multi-Runtime version of Buffout 4 NG's Crash Logger.<br>
-Supports OG (1.10.163.0), NG (1.10.984.0) and AE (1.11.221.0).
+Multi-Runtime version of Buffout 4 NG's Crash Logger with CrashLoggerSSE enhancements.<br>
+Supports all major game versions [OG (1.10.163.0), NG (1.10.984.0) and AE (1.11.221.0)].
 
 ### Requirements
 * [XMake](https://xmake.io) [3.0.0+]
