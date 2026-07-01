@@ -1623,6 +1623,9 @@ namespace Crash
 
 		std::int32_t __stdcall UnhandledExceptions(::EXCEPTION_POINTERS* a_exception) noexcept
 		{
+			if (a_exception && a_exception->ExceptionRecord && a_exception->ExceptionRecord->ExceptionCode == static_cast<DWORD>(EXCEPTION_STACK_OVERFLOW))
+				::_resetstkoflw();
+
 			// Install the SEH-to-C++ exception translator
 			_set_se_translator(seh_translator);
 
@@ -2004,6 +2007,11 @@ namespace Crash
 		}
 
 		REX::INFO("Crash Log Directory: {}"sv, crashPath.string());
+
+		{
+			ULONG stackGuarantee = 64 * 1024;
+			::SetThreadStackGuarantee(&stackGuarantee);
+		}
 
 		const auto success = ::AddVectoredExceptionHandler(1, reinterpret_cast<::PVECTORED_EXCEPTION_HANDLER>(&VectoredExceptions));
 		if (success == nullptr)
