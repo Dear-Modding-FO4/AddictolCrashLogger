@@ -563,6 +563,46 @@ namespace Crash
 			}
 		}
 
+		// Captures the actual PDB path DIA opens
+		class DiaLoadLogger : public IDiaLoadCallback2
+		{
+		public:
+			std::wstring openedPdb;
+
+			ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+			ULONG STDMETHODCALLTYPE Release() override { return 1; }
+			HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+			{
+				if (!ppv)
+					return E_INVALIDARG;
+				
+				if (riid == __uuidof(IUnknown) || riid == __uuidof(IDiaLoadCallback) || riid == __uuidof(IDiaLoadCallback2))
+				{
+					*ppv = static_cast<IDiaLoadCallback2*>(this);
+					return S_OK;
+				}
+
+				*ppv = nullptr;
+				return E_NOINTERFACE;
+			}
+
+			HRESULT STDMETHODCALLTYPE NotifyDebugDir(BOOL, DWORD, BYTE*) override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE NotifyOpenDBG(LPCOLESTR, HRESULT) override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE NotifyOpenPDB(LPCOLESTR a_pdbPath, HRESULT a_resultCode) override
+			{
+				if (SUCCEEDED(a_resultCode) && a_pdbPath)
+					openedPdb = a_pdbPath;
+					
+				return S_OK;
+			}
+			HRESULT STDMETHODCALLTYPE RestrictRegistryAccess() override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE RestrictSymbolServerAccess() override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE RestrictOriginalPathAccess() override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE RestrictReferencePathAccess() override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE RestrictDBGAccess() override { return S_OK; }
+			HRESULT STDMETHODCALLTYPE RestrictSystemRootAccess() override { return S_OK; }
+		};
+
 		// Helper struct to encapsulate PDB session setup
 		struct PdbSession
 		{
@@ -644,6 +684,7 @@ namespace Crash
 					searchPaths.push_back(fmt::format(fmt::runtime("cache*{}"s), symcache.c_str()));
 
 				// Try to load PDB
+				DiaLoadLogger loadLogger;
 				bool foundPDB = false;
 				for (const auto& path : searchPaths)
 				{
@@ -651,8 +692,10 @@ namespace Crash
 					wcsncpy(wszPath, path_w.c_str(), sizeof(wszPath) / sizeof(wchar_t));
 					wszPath[_MAX_PATH - 1] = L'\0';
 
-					LOG::INFO("Attempting to find pdb for {}+{:07X} with path {}", a_name, a_offset, path);
-					hr = pSource->loadDataForExe(wszFilename, wszPath, NULL);
+					// `path` is only a searchPath hint; DIA also searches the exe's directory and
+					// symbol paths, so the file it actually opens is reported via loadLogger below.
+					LOG::INFO("Attempting to load pdb for {}+{:07X} (searchPath {})", a_name, a_offset, path);
+					hr = pSource->loadDataForExe(wszFilename, wszPath, &loadLogger);
 					if (FAILED(hr))
 					{
 						auto error = print_hr_failure(hr);
@@ -666,7 +709,10 @@ namespace Crash
 				if (!foundPDB)
 					return false;
 
-				LOG::INFO("Successfully opened pdb for dll {}+{:07X}", a_name, a_offset);
+				if (!loadLogger.openedPdb.empty())
+					LOG::INFO("Successfully opened pdb for dll {}+{:07X} from {}", a_name, a_offset, std::filesystem::path(loadLogger.openedPdb).string());
+				else
+					LOG::INFO("Successfully opened pdb for dll {}+{:07X}", a_name, a_offset);
 
 				// Open session
 				if (FAILED(hr = pSource->openSession(&pSession)))
