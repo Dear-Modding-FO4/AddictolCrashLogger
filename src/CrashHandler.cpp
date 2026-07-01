@@ -95,8 +95,34 @@ namespace Crash
 		}
 	}
 
-	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except)
+	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except, const ::CONTEXT* a_context)
 	{
+		// Self-heal for a null / near-null EXECUTE access violation
+		const auto exceptionIp = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
+		const bool isNullCall =
+			a_except.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+			a_except.NumberParameters >= 1 &&
+			a_except.ExceptionInformation[0] == 8 &&  // execute
+			exceptionIp < 0x10000;
+
+		if (isNullCall && a_context)
+		{
+			const auto recovered = recover_null_call_stack(*a_context);
+			if (!recovered.empty())
+			{
+				_capturedFrames.clear();
+				_capturedFrames.reserve(recovered.size());
+
+				for (const auto addr : recovered)
+				{
+					_capturedFrames.emplace_back(addr);
+				}
+
+				_frames = std::span(_capturedFrames);
+				return;
+			}
+		}
+
 		auto [capturedFrames, success] = safe_capture_stacktrace();
 		_capturedFrames = std::move(capturedFrames);
 
@@ -562,12 +588,38 @@ namespace Crash
 			}
 		}
 
+		// Handle a null / near-null EXECUTE access violation
+		// Returns true if the violation was a null call
+		bool print_null_call_analysis(
+			spdlog::logger& a_log,
+			const ::EXCEPTION_RECORD& a_exception)
+		{
+			const auto ipValue = reinterpret_cast<std::uintptr_t>(a_exception.ExceptionAddress);
+			const bool isExecute = a_exception.ExceptionInformation[0] == 8;
+			if (!isExecute || ipValue >= 0x10000)
+				return false;
+
+			a_log.critical("ACCESS VIOLATION ANALYSIS:"sv);
+			a_log.critical("\tRIP = 0x{:X} -- null function-pointer call (executed an unmapped address)."sv, ipValue);
+			a_log.critical("\tThe faulting frame has no unwind data, so the primary call stack below has"sv);
+			a_log.critical("\tbeen reseeded from the return address at [RSP]; the OS exception-dispatch"sv);
+			a_log.critical("\tand CrashLogger handler frames are omitted as they are not the cause."sv);
+			return true;
+		}
+
 		void print_access_violation_analysis(
 			spdlog::logger& a_log,
 			const ::EXCEPTION_RECORD& a_exception,
 			const ::CONTEXT& a_context)
 		{
 			const auto ip = a_exception.ExceptionAddress;
+
+			// Null / near-null EXECUTE access violations (a call/jmp through a null function pointer)
+			// have nothing to disassemble at the fault IP, so they are annotated separately (the
+			// corrected call stack itself is reseeded inside Callstack).
+			if (print_null_call_analysis(a_log, a_exception))
+				return;
+
 			ZydisDisassembledInstruction instruction{};
 
 			// Guard against reading invalid memory at ExceptionAddress
@@ -1718,7 +1770,7 @@ namespace Crash
 				std::string throwLocation;
 				try
 				{
-					callstack.emplace(*a_exception->ExceptionRecord);
+					callstack.emplace(*a_exception->ExceptionRecord, a_exception->ContextRecord);
 					if (IsCppException(*a_exception->ExceptionRecord))
 						throwLocation = callstack->get_throw_location(cmodules);
 				}
@@ -1785,7 +1837,7 @@ namespace Crash
 					try
 					{
 						const Callstack* callstack_ptr = callstack ? &(*callstack) : nullptr;
-						Callstack fallback{ *a_exception->ExceptionRecord };
+						Callstack fallback{ *a_exception->ExceptionRecord, a_exception->ContextRecord };
 						if (!callstack_ptr)
 							callstack_ptr = &fallback;
 
@@ -2005,7 +2057,7 @@ namespace Crash
 					{
 						static std::atomic_bool handling{ false };
 						bool expected = false;
-						
+
 						if (handling.compare_exchange_strong(expected, true))
 							UnhandledExceptions(a_exception);  // logs + TerminateProcess; never returns
 						
