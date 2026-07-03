@@ -3,7 +3,7 @@ includes("lib/commonlibf4")
 
 -- name and version
 local plugin_name = "AddictolCrashLogger"
-local plugin_version = "1.4.0"
+local plugin_version = "1.5.0"
 local plugin_version_major, plugin_version_minor, plugin_version_patch = plugin_version:match("^(%d+)%.(%d+)%.(%d+)$")
 
 -- set project constants
