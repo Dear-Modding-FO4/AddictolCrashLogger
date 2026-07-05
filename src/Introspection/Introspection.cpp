@@ -33,45 +33,34 @@ namespace Crash::Introspection::F4
 		public:
 			using value_type = RE::BSResource::LooseFileStreamBase;
 
-			static void filter(
-				filter_results& a_results,
-				const void* a_ptr, int tab_depth = 0) noexcept
+			static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 			{
 				const auto stream = static_cast<const value_type*>(a_ptr);
 
-				try {
+				// Directory Name
+				try
+				{
 					const auto dirName = stream->GetDirName();
-					if (!dirName.empty())
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}Directory Name"sv,
-								"",
-								tab_depth),
-							quoted(dirName));
+					if (!dirName.empty() && dirName[0])
+						a_results.emplace_back(fmt::format("{:\t>{}}Directory Name"sv, "", tab_depth), quoted(dirName));
 				}
 				catch (...) {}
 
-				try {
+				// File Name
+				try
+				{
 					const auto fileName = stream->GetFileName();
-					if (!fileName.empty())
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}File Name"sv,
-								"",
-								tab_depth),
-							quoted(fileName));
+					if (!fileName.empty() && fileName[0])
+						a_results.emplace_back(fmt::format("{:\t>{}}File Name"sv, "", tab_depth), quoted(fileName));
 				}
 				catch (...) {}
 
-				try {
+				// Prefix
+				try
+				{
 					const auto prefix = stream->GetPrefix();
-					if (!prefix.empty())
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}Prefix"sv,
-								"",
-								tab_depth),
-							quoted(prefix));
+					if (!prefix.empty() && prefix[0])
+						a_results.emplace_back(fmt::format("{:\t>{}}Prefix"sv, "", tab_depth), quoted(prefix));
 				}
 				catch (...) {}
 			}
