@@ -496,17 +496,17 @@ namespace Crash::Introspection::F4
 			// Extra Data
 			try
 			{
-				if (!form->extra)
-					return;
-
-				for (auto i = 0; i < form->GetExtraDataSize(); i++)
+				if (form->extra)
 				{
-					const auto extraData = form->extra->extra[i];
-					if (!extraData->GetName().empty())
+					for (auto i = 0; i < form->GetExtraDataSize(); i++)
 					{
-						const auto name = extraData->GetName().c_str();
-						if (name && name[0])
-							a_results.emplace_back(fmt::format("{:\t>{}}ExtraData[{}] Name"sv, "", tab_depth, i), quoted(name));
+						const auto extraData = form->extra->extra[i];
+						if (!extraData->GetName().empty())
+						{
+							const auto name = extraData->GetName().c_str();
+							if (name && name[0])
+								a_results.emplace_back(fmt::format("{:\t>{}}ExtraData[{}] Name"sv, "", tab_depth, i), quoted(name));
+						}
 					}
 				}
 			}
@@ -518,26 +518,24 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::NiAVObject;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 			if (!object)
 				return;
-			try {
+
+			// Name
+			try
+			{
 				const auto name = object ? object->name.c_str() : ""sv;
 				if (!name.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Name"sv,
-							""sv,
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}Name"sv, ""sv, tab_depth), quoted(name));
 			}
 			catch (...) {}
 
-			try {
+			// RTTI Name
+			try
+			{
 				const auto name = object->GetRTTI() ? object->GetRTTI()->GetName() : ""sv;
 				if (!name.empty())
 					a_results.emplace_back(
@@ -549,42 +547,57 @@ namespace Crash::Introspection::F4
 			}
 			catch (...) {}
 
-			try {
+			// Extra Data
+			try 
+			{
+				if (object->extra)
+				{
+					for (auto i = 0; i < object->GetExtraDataSize(); i++)
+					{
+						const auto extraData = object->extra->extra[i];
+						if (!extraData->GetName().empty())
+						{
+							const auto name = extraData->GetName().c_str();
+							if (name && name[0])
+								a_results.emplace_back(fmt::format("{:\t>{}}ExtraData[{}] Name"sv, "", tab_depth, i), quoted(name));
+						}
+					}
+				}
+			} catch (...) {}
+
+			// Flags
+			try
+			{
 				const auto flags = object->GetFlags();
-				a_results.emplace_back(
-					fmt::format(
-						"{:\t>{}}Flags"sv,
-						""sv,
-						tab_depth),
-					fmt::format(
-						"{0:x}"sv,
-						flags));
+				a_results.emplace_back(fmt::format("{:\t>{}}Flags"sv, ""sv, tab_depth), fmt::format("{0:x}"sv, flags));
 			}
 			catch (...) {}
 
-			try {
+
+			// TESObjectREFR
+			try
+			{
 				const auto objectRefr = RE::TESObjectREFR::FindReferenceFor3D((RE::NiAVObject*)a_ptr);
-				if (objectRefr) {
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Checking TESObjectREFR"sv,
-							"",
-							tab_depth),
-						""sv);
+				if (objectRefr)
+				{
+					const auto objectref = objectRefr->GetObjectReference();
+					const auto filename = objectref && objectref->As<RE::TESModel>() ? objectref->As<RE::TESModel>()->GetModel() : ""sv;
+					if (!filename.empty())
+						a_results.emplace_back(fmt::format("{:\t>{}}File"sv, "", tab_depth), quoted(filename));
+					
+					a_results.emplace_back(fmt::format("{:\t>{}}Checking TESObjectREFR"sv, "", tab_depth), "{}"sv);
 					TESObjectREFR::filter(a_results, objectRefr, tab_depth + 1);
 				}
 			}
 			catch (...) {}
 
-			try {
+			// Parent
+			try
+			{
 				const auto parent = object->parent;
-				if (parent) {
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Checking Parent"sv,
-							""sv,
-							tab_depth),
-						""sv);
+				if (parent)
+				{
+					a_results.emplace_back(fmt::format("{:\t>{}}Checking Parent"sv, ""sv, tab_depth), ""sv);
 					filter(a_results, parent, tab_depth + 1);
 				}
 			}
@@ -597,30 +610,17 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::TESQuest;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 			if (!object)
 				return;
-			try {
-				a_results.emplace_back(
-					fmt::format(
-						fmt::runtime("{:\t>{}}Already Run Quest"),
-						"",
-						tab_depth),
-					fmt::format(
-						"{}",
-						object->alreadyRun));
-				a_results.emplace_back(
-					fmt::format(
-						fmt::runtime("{:\t>{}}Current Stage"),
-						"",
-						tab_depth),
-					fmt::format(
-						"{}",
-						object->currentStage));
+
+			try
+			{
+				a_results.emplace_back(fmt::format(fmt::runtime("{:\t>{}}Already Run Quest"), "", tab_depth), fmt::format("{}", object->alreadyRun));
+				a_results.emplace_back(fmt::format(fmt::runtime("{:\t>{}}Current Stage"), "", tab_depth), fmt::format("{}",object->currentStage));
+				a_results.emplace_back(fmt::format(fmt::runtime("{:\t>{}}Type"), "", tab_depth), fmt::format("{}",object->data.questType));
 			}
 			catch (...) {}
 		};
@@ -631,38 +631,35 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::ExtraTextDisplayData;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 
-			try {
+			// Display Name
+			try
+			{
 				const auto name = object->displayName.c_str();
 				if (name && name[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Display Name"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}Display Name"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
-			try {
+
+			// BGSMessage Form
+			try
+			{
 				const auto& displayNameText = object->displayNameText;
 				if (displayNameText)
 					TESForm<RE::BGSMessage>::filter(a_results, displayNameText, tab_depth + 1);
 			}
 			catch (...) {}
-			try {
+
+			// Owner Quest
+			try
+			{
 				const auto quest = object->ownerQuest;
-				if (quest) {
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Owner Quest"sv,
-							""sv,
-							tab_depth),
-						""sv);
+				if (quest)
+				{
+					a_results.emplace_back(fmt::format("{:\t>{}}Owner Quest"sv, ""sv, tab_depth), ""sv);
 					TESQuest::filter(a_results, quest, tab_depth + 1);
 				}
 			}
