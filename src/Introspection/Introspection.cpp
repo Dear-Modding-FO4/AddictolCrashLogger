@@ -206,6 +206,7 @@ namespace Crash::Introspection::F4
 			// }
 			// catch (...) {}
 
+			// File Path
 			try
 			{
 				const auto filePath = object->filePath;
@@ -248,34 +249,27 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::NiTexture;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 			if (!object)
 				return;
-			try {
+
+			// Name
+			try
+			{
 				const auto name = object ? object->name.c_str() : ""sv;
 				if (!name.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Name"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}Name"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
 
-			try {
+			// RTTI Name
+			try
+			{
 				const auto name = object->GetRTTI() ? object->GetRTTI()->GetName() : ""sv;
 				if (!name.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}RTTIName"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}RTTIName"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
 		}
@@ -460,44 +454,61 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::BSShaderProperty;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto form = static_cast<const value_type*>(a_ptr);
 
-			try {
+			// Form Flags
+			try
+			{
 				const auto formFlags = form->flags;
-				a_results.emplace_back(
-					fmt::format(
-						fmt::runtime("{:\t>{}}Flags"),
-						""sv,
-						tab_depth),
-					fmt::format(
-						fmt::runtime("0x{:08X}"),
-						formFlags.underlying()));
+				a_results.emplace_back(fmt::format(fmt::runtime("{:\t>{}}Flags"), ""sv, tab_depth), fmt::format(fmt::runtime("0x{:08X}"), formFlags.underlying()));
 			}
 			catch (...) {}
-			try {
+
+			// Name
+			try
+			{
 				const auto name = form->name.c_str();
 				if (name && name[0])
-					a_results.emplace_back(
-						fmt::format(
-							fmt::runtime("{:\t>{}}Name"),
-							""sv,
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format(fmt::runtime("{:\t>{}}Name"), ""sv, tab_depth), quoted(name));
 			}
 			catch (...) {}
-			try {
+
+			// RTTI Name
+			try
+			{
 				const auto rttiname = form->GetRTTI() ? form->GetRTTI()->GetName() : ""sv;
 				if (!rttiname.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}RTTIName"sv,
-							""sv,
-							tab_depth),
-						quoted(rttiname));
+					a_results.emplace_back(fmt::format("{:\t>{}}RTTIName"sv, ""sv, tab_depth), quoted(rttiname));
+			}
+			catch (...) {}
+
+			// NiProperty Type
+			// try
+			// {
+			// 	const auto formType = form->Type();
+			// 	if (formType)
+			// 		a_results.emplace_back(fmt::format("{:\t>{}}NiPropertyType"sv, "", tab_depth), fmt::format("{}"sv, formType));
+			// }
+			// catch (...) {}
+
+			// Extra Data
+			try
+			{
+				if (!form->extra)
+					return;
+
+				for (auto i = 0; i < form->GetExtraDataSize(); i++)
+				{
+					const auto extraData = form->extra->extra[i];
+					if (!extraData->GetName().empty())
+					{
+						const auto name = extraData->GetName().c_str();
+						if (name && name[0])
+							a_results.emplace_back(fmt::format("{:\t>{}}ExtraData[{}] Name"sv, "", tab_depth, i), quoted(name));
+					}
+				}
 			}
 			catch (...) {}
 		}
