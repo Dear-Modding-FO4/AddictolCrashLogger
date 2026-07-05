@@ -317,108 +317,79 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = T;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto form = static_cast<const value_type*>(a_ptr);
 
-			try {
+			// Filename
+			try
+			{
 				const auto file = form->GetDescriptionOwnerFile();
 				const auto filename = file ? file->GetFilename() : ""sv;
 				if (!filename.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}File"sv,
-							""sv,
-							tab_depth),
-						quoted(filename));
+					a_results.emplace_back(fmt::format("{:\t>{}}File"sv, ""sv, tab_depth), quoted(filename));
 			}
 			catch (...) {}
 
-			try {
+			// Modified by
+			try
+			{
 				auto sourcefiles = form->sourceFiles.array;
-				if (sourcefiles && sourcefiles->size() > unsigned(1)) {
+				if (sourcefiles && sourcefiles->size() > unsigned(1))
+				{
 					std::string filesString = "";
-					for (auto index = unsigned(0); index < sourcefiles->size(); index++) {
+					for (auto index = unsigned(0); index < sourcefiles->size(); index++)
+					{
 						auto sourcefile = sourcefiles->data()[index];
-						filesString = filesString.empty() ? fmt::format("{}"sv,
-							sourcefile->GetFilename().data()) :
-							fmt::format("{} -> {}"sv,
-								filesString, sourcefile->GetFilename().data());
+						filesString = filesString.empty() ? fmt::format("{}"sv, sourcefile->GetFilename().data()) : fmt::format("{} -> {}"sv, filesString, sourcefile->GetFilename().data());
 					}
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Modified by"sv,
-							"",
-							tab_depth),
-						filesString);
+
+					a_results.emplace_back(fmt::format("{:\t>{}}Modified by"sv, "", tab_depth), filesString);
 				}
 			}
 			catch (...) {}
 
-			try {
+			// Form Flags
+			try
+			{
 				const auto formFlags = form->GetFormFlags();
-				a_results.emplace_back(
-					fmt::format(
-						"{:\t>{}}Flags"sv,
-						""sv,
-						tab_depth),
-					fmt::format(
-						"0x{:08X}"sv,
-						formFlags));
-			}
+                a_results.emplace_back(fmt::format("{:\t>{}}Flags"sv, ""sv, tab_depth), fmt::format("0x{:08X}"sv, formFlags));
+            }
 			catch (...) {}
 
-			try {
+			// Object Type Name
+			try
+			{
 				const auto name = form->GetObjectTypeName();
 				if (name && name[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Name"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}Name"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
 
-			try {
+			// Form Editor ID
+			try
+			{
 				const auto editorID = form->GetFormEditorID();
 				if (editorID && editorID[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}EditorID"sv,
-							""sv,
-							tab_depth),
-						quoted(editorID));
+					a_results.emplace_back(fmt::format("{:\t>{}}EditorID"sv, ""sv, tab_depth), quoted(editorID));
 			}
 			catch (...) {}
 
-			try {
+			// Form ID
+			try
+			{
 				const auto formID = form->GetFormID();
-				a_results.emplace_back(
-					fmt::format(
-						"{:\t>{}}FormID"sv,
-						""sv,
-						tab_depth),
-					fmt::format(
-						"0x{:08X}"sv,
-						formID));
+				a_results.emplace_back(fmt::format("{:\t>{}}FormID"sv, ""sv, tab_depth), fmt::format("0x{:08X}"sv, formID));
 			}
 			catch (...) {}
 
-			try {
+			// Form Type
+			try
+			{
 				const auto formType = form->GetFormType();
 				const auto formTypeName = magic_enum::enum_name(formType);
 				if (!formTypeName.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}FormType"sv,
-							"",
-							tab_depth),
-						fmt::format(
-							"{} ({:02})"sv,
-							formTypeName, std::to_underlying(formType)));
+					a_results.emplace_back(fmt::format("{:\t>{}}FormType"sv, "", tab_depth), fmt::format("{} ({:02})"sv, formTypeName, std::to_underlying(formType)));
 			}
 			catch (...) {}
 		}
@@ -429,23 +400,18 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::TESFullName;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
-
 			if (!object)
 				return;
-			try {
+
+			// Full Name
+			try
+			{
 				const auto name = object->GetFullName();
 				if (name && name[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}GetFullName"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}GetFullName"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
 		}
