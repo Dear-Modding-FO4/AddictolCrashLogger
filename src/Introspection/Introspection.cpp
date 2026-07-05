@@ -76,45 +76,28 @@ namespace Crash::Introspection::F4
 			public:
 				using value_type = RE::BSScript::NF_util::NativeFunctionBase;
 
-				static void filter(
-					filter_results& a_results,
-					const void* a_ptr, int tab_depth = 0) noexcept
+				static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 				{
 					const auto function = static_cast<const value_type*>(a_ptr);
 
-					try {
+					// Function
+					try
+					{
 						const std::string_view name = function->GetName();
-						if (!name.empty())
-							a_results.emplace_back(
-								fmt::format(
-									"{:\t>{}}Function"sv,
-									"",
-									tab_depth),
-								quoted(name));
-					}
-					catch (...) {}
-
-					try {
 						const std::string_view objName = function->GetObjectTypeName();
-						if (!objName.empty())
-							a_results.emplace_back(
-								fmt::format(
-									"{:\t>{}}Object"sv,
-									"",
-									tab_depth),
-								quoted(objName));
+						if (!name.empty() && !objName.empty())
+							a_results.emplace_back(fmt::format("{:\t>{}}Function"sv, "", tab_depth), fmt::format("\"{}.{}\""sv, objName, name));
+						else if (!name.empty())
+							a_results.emplace_back(fmt::format("{:\t>{}}Function"sv, "", tab_depth), quoted(name));
 					}
 					catch (...) {}
 
-					try {
+					// State Name
+					try
+					{
 						const std::string_view stateName = function->GetStateName();
 						if (!stateName.empty())
-							a_results.emplace_back(
-								fmt::format(
-									"{:\t>{}}State"sv,
-									"",
-									tab_depth),
-								quoted(stateName));
+							a_results.emplace_back(fmt::format("{:\t>{}}State"sv, "", tab_depth), quoted(stateName));
 
 					}
 					catch (...) {}
@@ -127,33 +110,25 @@ namespace Crash::Introspection::F4
 		public:
 			using value_type = RE::BSScript::ObjectTypeInfo;
 
-			static void filter(
-				filter_results& a_results,
-				const void* a_ptr, int tab_depth = 0) noexcept
+			static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 			{
 				const auto info = static_cast<const value_type*>(a_ptr);
 
-				try {
+				// Name
+				try
+				{
 					const std::string_view name = info->name;
 					if (!name.empty())
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}Name"sv,
-								"",
-								tab_depth),
-							quoted(name));
+						a_results.emplace_back(fmt::format("{:\t>{}}Name"sv, "", tab_depth), quoted(name));
 				}
 				catch (...) {}
 
-				try {
+				// DocString
+				try
+				{
 					const std::string_view docString = info->docString;
 					if (!docString.empty())
-						a_results.emplace_back(
-							fmt::format(
-								"{:\t>{}}DocString"sv,
-								"",
-								tab_depth),
-							quoted(docString));
+						a_results.emplace_back(fmt::format("{:\t>{}}DocString"sv, "", tab_depth), quoted(docString));
 				}
 				catch (...) {}
 			}
