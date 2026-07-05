@@ -140,21 +140,16 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::NiObjectNET;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 
-			try {
+			// Name
+			try
+			{
 				const auto name = object->GetName();
 				if (!name.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}Name"sv,
-							"",
-							tab_depth),
-						quoted(name));
+					a_results.emplace_back(fmt::format("{:\t>{}}Name"sv, "", tab_depth), quoted(name));
 			}
 			catch (...) {}
 		}
@@ -165,32 +160,26 @@ namespace Crash::Introspection::F4
 	public:
 		using value_type = RE::NiStream;
 
-		static void filter(
-			filter_results& a_results,
-			const void* a_ptr, int tab_depth = 0) noexcept
+		static void filter(filter_results& a_results, const void* a_ptr, int tab_depth = 0) noexcept
 		{
 			const auto object = static_cast<const value_type*>(a_ptr);
 			if (!object)
 				return;
-			try {
+
+			// File Name
+			try
+			{
 				const auto fileName = object->GetFileName();
 				if (!fileName.empty())
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}File Name"sv,
-							""sv,
-							tab_depth),
-						quoted(fileName));
+					a_results.emplace_back(fmt::format("{:\t>{}}File Name"sv, ""sv, tab_depth), quoted(fileName));
 			}
 			catch (...) {}
-			try {
+
+			// Header
+			try
+			{
 				const auto& header = object->bsStreamHeader;
-				a_results.emplace_back(
-					fmt::format(
-						"{:\t>{}}Header"sv,
-						"",
-						tab_depth),
-					fmt::format(
+				a_results.emplace_back(fmt::format("{:\t>{}}Header"sv, "", tab_depth), fmt::format(
 						"author: {} version: {} processScript: {} exportScript: {}",
 						header.author,
 						header.version,
@@ -199,39 +188,56 @@ namespace Crash::Introspection::F4
 			}
 			catch (...) {}
 
-			try {
+			// Last Loaded RTTI
+			try
+			{
 				const auto lastLoadedRTTI = object->lastLoadedRTTI;
 				if (lastLoadedRTTI && lastLoadedRTTI[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}lastLoadedRTTI"sv,
-							"",
-							tab_depth),
-						quoted(lastLoadedRTTI));
+					a_results.emplace_back(fmt::format("{:\t>{}}lastLoadedRTTI"sv, "", tab_depth), quoted(lastLoadedRTTI));
 			}
 			catch (...) {}
 
-			try {
-				const auto fileName = object->fileName;
-				if (fileName && fileName[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}fileName"sv,
-							"",
-							tab_depth),
-						quoted(fileName));
-			}
-			catch (...) {}
+			// Duplicated?
+			// try
+			// {
+			// 	const auto fileName = object->fileName;
+			// 	if (fileName && fileName[0])
+			// 		a_results.emplace_back(fmt::format("{:\t>{}}fileName"sv, "", tab_depth), quoted(fileName));
+			// }
+			// catch (...) {}
 
-			try {
+			try
+			{
 				const auto filePath = object->filePath;
 				if (filePath && filePath[0])
-					a_results.emplace_back(
-						fmt::format(
-							"{:\t>{}}filePath"sv,
-							"",
-							tab_depth),
-						quoted(filePath));
+					a_results.emplace_back(fmt::format("{:\t>{}}filePath"sv, "", tab_depth), quoted(filePath));
+			}
+			catch (...) {}
+
+			// If filePath/inputFilePath are empty (e.g. NIF loaded from a BSA into a memory
+			// buffer), the underlying input stream still knows its resource name. Only walk it
+			// if iStr's vtable matches BSResourceNiBinaryStream — calling DoGetName on the wrong
+			// subclass from a crash handler would re-crash us.
+			try
+			{
+				const auto iStr = object->istr;
+				if (iStr)
+				{
+					const auto vt = *reinterpret_cast<const std::uintptr_t*>(iStr);
+					if (vt == RE::VTABLE::BSResourceNiBinaryStream[0].address())
+					{
+						const auto brnbs = static_cast<const RE::BSResourceNiBinaryStream*>(iStr);
+						const auto stream = brnbs->stream.get();
+
+						if (stream)
+						{
+							RE::BSFixedString resName;
+							stream->DoGetName(resName);
+							if (!resName.empty())
+								a_results.emplace_back(fmt::format("{:\t>{}}streamName"sv, "", tab_depth), quoted(resName.c_str()));
+						}
+					}
+				}
 			}
 			catch (...) {}
 		}
