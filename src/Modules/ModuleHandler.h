@@ -2,11 +2,6 @@
 
 namespace Crash
 {
-	namespace PDB
-	{
-		class SymbolResolver;
-	}
-
 	namespace Modules
 	{
 		namespace detail
@@ -20,11 +15,8 @@ namespace Crash
 			virtual ~Module() noexcept = default;
 
 			[[nodiscard]] std::uintptr_t address() const noexcept { return reinterpret_cast<std::uintptr_t>(_image.data()); }
-			[[nodiscard]] std::size_t size() const noexcept { return _image.size(); }
 
-			[[nodiscard]] std::string frame_info(
-				const boost::stacktrace::frame& a_frame,
-				PDB::SymbolResolver& a_symbols) const;
+			[[nodiscard]] std::string frame_info(const boost::stacktrace::frame& a_frame) const;
 
 			// Return std::string of assembly for a_ptr
 			[[nodiscard]] std::string assembly(const void* a_ptr) const;
@@ -57,9 +49,7 @@ namespace Crash
 
 			Module(std::string a_name, std::span<const std::byte> a_image);
 			Module(std::string a_name, std::span<const std::byte> a_image, std::string a_path);
-			[[nodiscard]] virtual std::string get_frame_info(
-				const boost::stacktrace::frame& a_frame,
-				PDB::SymbolResolver& a_symbols) const;
+			[[nodiscard]] virtual std::string get_frame_info(const boost::stacktrace::frame& a_frame) const;
 
 		private:
 			std::string _name;

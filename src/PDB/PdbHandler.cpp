@@ -1,23 +1,14 @@
 // SPDX-License-Identifier: CC-BY-SA-4.0
 // Code from StackOverflow
 
+#pragma once
 #include "PdbHandler.h"
-#include "Capture/DbgHelpGate.h"
-#include "Settings.h"
 #include <DbgHelp.h>
-#include <algorithm>
-#include <array>
 #include <atlcomcli.h>
+#include <codecvt>
 #include <comdef.h>
-#include <fmt/format.h>
-#include <limits>
-#include <mutex>
-#include <stdexcept>
-#include <system_error>
-#include <unordered_map>
-#include <vector>
-
-using namespace std::literals;
+#include <regex>
+#include <unordered_set>
 
 #undef ERROR
 
@@ -53,50 +44,75 @@ namespace Crash
 {
 	namespace PDB
 	{
+		std::atomic<bool> symcacheChecked = false;
+		std::atomic<bool> symcacheValid = false;
+		//https://stackoverflow.com/questions/6284524/bstr-to-stdstring-stdwstring-and-vice-versa
 		std::string ConvertWCSToMBS(const wchar_t* pstr, long wslen)
 		{
-			if (wslen == 0)
-				return {};
-			if (!pstr || wslen < 0)
-				throw std::invalid_argument("Invalid wide symbol string");
-			const auto size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, pstr, wslen, nullptr, 0, nullptr, nullptr);
-			if (size == 0)
-				throw std::system_error(GetLastError(), std::system_category(), "Symbol text conversion");
-			std::string result(static_cast<std::size_t>(size), '\0');
-			if (::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, pstr, wslen, result.data(), size, nullptr, nullptr) != size)
-				throw std::system_error(GetLastError(), std::system_category(), "Symbol text conversion");
-			return result;
+			int len = ::WideCharToMultiByte(CP_ACP, 0, pstr, wslen, NULL, 0, NULL, NULL);
+
+			std::string dblstr(len, '\0');
+			len = ::WideCharToMultiByte(CP_ACP, 0 /* no flags */,
+				pstr, wslen /* not necessary NULL-terminated */,
+				&dblstr[0], len,
+				NULL, NULL /* no default char */);
+
+			return dblstr;
 		}
 
 		std::string ConvertBSTRToMBS(BSTR bstr)
 		{
-			const auto size = ::SysStringLen(bstr);
-			if (size > static_cast<unsigned long>((std::numeric_limits<long>::max)()))
-				throw std::length_error("Symbol text exceeds conversion limit");
-			return ConvertWCSToMBS(bstr, static_cast<long>(size));
+			int wslen = ::SysStringLen(bstr);
+			return ConvertWCSToMBS((wchar_t*)bstr, wslen);
+		}
+
+		BSTR ConvertMBSToBSTR(const std::string& str)
+		{
+			int wslen = ::MultiByteToWideChar(CP_ACP, 0 /* no flags */,
+				str.data(), str.length(),
+				NULL, 0);
+
+			BSTR wsdata = ::SysAllocStringLen(NULL, wslen);
+			::MultiByteToWideChar(CP_ACP, 0 /* no flags */,
+				str.data(), str.length(),
+				wsdata, wslen);
+			return wsdata;
 		}
 
 		std::wstring utf8_to_utf16(const std::string& utf8)
 		{
-			if (utf8.empty())
-				return {};
-			if (utf8.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
-				throw std::length_error("Symbol path exceeds conversion limit");
-			const auto length = static_cast<int>(utf8.size());
-			const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
-			if (size == 0)
-				throw std::system_error(GetLastError(), std::system_category(), "Symbol path conversion");
-			std::wstring result(static_cast<std::size_t>(size), L'\0');
-			if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), size) != size)
-				throw std::system_error(GetLastError(), std::system_category(), "Symbol path conversion");
-			return result;
+			std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+			return converter.from_bytes(utf8);
 		}
 
 		std::string utf16_to_utf8(const std::wstring& utf16)
 		{
-			if (utf16.size() > static_cast<std::size_t>((std::numeric_limits<long>::max)()))
-				throw std::length_error("Symbol text exceeds conversion limit");
-			return ConvertWCSToMBS(utf16.data(), static_cast<long>(utf16.size()));
+			std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+			return converter.to_bytes(utf16);
+		}
+
+		[[nodiscard]] static std::string trim(const std::string& str)
+		{
+			const auto start = str.find_first_not_of(" \t\n\r");
+			const auto end = str.find_last_not_of(" \t\n\r");
+			return (start == std::string::npos) ? "" : str.substr(start, end - start + 1);
+		}
+
+		[[nodiscard]] static std::wstring trim(const std::wstring& wstr)
+		{
+			auto start = wstr.begin();
+			while (start != wstr.end() && std::iswspace(*start))
+			{
+				++start;
+			}
+
+			auto end = wstr.end();
+			do
+			{
+				--end;
+			} while (end != start && std::iswspace(*end));
+
+			return std::wstring(start, end + 1);
 		}
 
 		[[nodiscard]] std::string demangle(const std::wstring& mangled)
@@ -105,9 +121,8 @@ namespace Crash
 			if (mangled.empty() || mangled[0] != L'?')
 				return utf16_to_utf8(mangled);
 
-			auto lock = Capture::DbgHelpGate::try_lock();
-			if (!lock.owns_lock())
-				return utf16_to_utf8(mangled);
+			static std::mutex demangle_mutex;
+			std::lock_guard lock{ demangle_mutex };
 
 			// Use a larger buffer for complex names
 			std::array<wchar_t, 0x2000> buffer{ L'\0' };
@@ -163,9 +178,8 @@ namespace Crash
 			if (mangled[0] == '.')
 			{
 				// RTTI type descriptor: skip the leading dot
-				auto lock = Capture::DbgHelpGate::try_lock();
-				if (!lock.owns_lock())
-					return mangled;
+				static std::mutex m;
+				std::lock_guard lock{ m };
 				std::array<char, 0x1000> buf{ '\0' };
 				// Use UNDNAME_NAME_ONLY to get just the type name
 				const auto len = UnDecorateSymbolName(
@@ -195,9 +209,8 @@ namespace Crash
 			else if (mangled[0] == '?')
 			{
 				// MSVC symbol name
-				auto lock = Capture::DbgHelpGate::try_lock();
-				if (!lock.owns_lock())
-					return mangled;
+				static std::mutex demangle_mutex;
+				std::lock_guard lock{ demangle_mutex };
 				std::array<char, 0x2000> buffer{ '\0' };
 				const auto length = UnDecorateSymbolName(
 					mangled.c_str(),
@@ -244,110 +257,89 @@ namespace Crash
 			return std::wstring(bstr, SysStringLen(bstr));
 		}
 
-		SourceLines read_source_lines(IDiaEnumLineNumbers* a_lines)
+		std::string processSymbol(IDiaSymbol* a_symbol, IDiaSession* a_session, const DWORD& a_rva, std::string_view& a_name, uintptr_t& a_offset, std::string& a_result)
 		{
-			SourceLines result;
-			if (!a_lines)
-				return result;
-			constexpr std::size_t maximumLines = 5;
-			for (std::size_t i = 0; i < maximumLines; ++i)
-			{
-				CComPtr<IDiaLineNumber> line;
-				ULONG fetched{};
-				const auto status = a_lines->Next(1, &line, &fetched);
-				if (FAILED(status))
-				{
-					result.status = status;
-					return result;
-				}
-				if (fetched != 1 || !line)
-				{
-					if (status == S_OK || fetched != 0)
-						result.status = E_UNEXPECTED;
-					return result;
-				}
-				SourceLine source;
-				CComPtr<IDiaSourceFile> file;
-				if (line->get_sourceFile(&file) == S_OK && file)
-				{
-					CComBSTR name;
-					if (file->get_fileName(&name) == S_OK && name)
-						source.file = ConvertBSTRToMBS(name);
-				}
-				if (line->get_lineNumber(&source.number) != S_OK)
-					source.number = 0;
-				if (!source.file.empty() || source.number != 0)
-				{
-					result.lines.push_back(std::move(source));
-					result.status = S_OK;
-				}
-				if (status == S_FALSE)
-					return result;
-			}
-			result.limitReached = true;
-			return result;
-		}
+			CComBSTR name;
+			if (!a_symbol || a_symbol->get_name(&name) != S_OK || !name)
+				return a_result;
 
-		namespace
-		{
-			SymbolDetails describe_symbol(IDiaSymbol* a_symbol, IDiaSession* a_session, DWORD a_rva)
+			// Demangle the symbol name
+			std::string demangledName = demangle(bstr_to_wstring(name));
+
+			DWORD rva{};
+			if (a_rva == 0)
 			{
-				SymbolDetails result;
-				if (!a_symbol)
+				if (a_symbol->get_relativeVirtualAddress(&rva) != S_OK)
+					return a_result;
+			}
+			else
+				rva = a_rva;
+
+			ULONGLONG length = 0;
+			if (a_symbol->get_length(&length) == S_OK)
+			{
+				CComPtr<IDiaEnumLineNumbers> lineNums;
+				if (a_session && a_session->findLinesByRVA(rva, length, &lineNums) == S_OK && lineNums)
 				{
-					result.status = E_POINTER;
-					result.issue = "No DIA symbol";
-					return result;
-				}
-				CComBSTR name;
-				result.status = a_symbol->get_name(&name);
-				if (result.status != S_OK || !name || name.Length() == 0)
-				{
-					if (result.status == S_OK)
-						result.status = S_FALSE;
-					result.issue = "Symbol name unavailable";
-					return result;
-				}
-				result.text = demangle(bstr_to_wstring(name));
-				DWORD symbolRva{};
-				if (a_symbol->get_relativeVirtualAddress(&symbolRva) == S_OK && a_rva >= symbolRva && a_rva != symbolRva)
-					result.text += fmt::format("+0x{:X}", a_rva - symbolRva);
-				if (!a_session)
-				{
-					result.issue = "Source lines unavailable: no DIA session";
-					return result;
-				}
-				CComPtr<IDiaEnumLineNumbers> enumerator;
-				const auto lineStatus = a_session->findLinesByRVA(a_rva, 1, &enumerator);
-				if (lineStatus != S_OK || !enumerator)
-				{
-					result.issue = fmt::format("Source lines unavailable (0x{:08X})", static_cast<std::uint32_t>(lineStatus));
-					return result;
-				}
-				const auto sources = read_source_lines(enumerator);
-				for (const auto& source : sources.lines)
-				{
-					result.text += source.file.empty() ? " at <source unavailable>" : " at " + source.file;
-					if (source.number != 0)
+					bool found_source = false;
+					bool found_line = false;
+
+					for (uint8_t i = 0; i < 5; ++i) {
+						CComPtr<IDiaLineNumber> lineNum;
+						ULONG fetched{};
+						if (lineNums->Next(1, &lineNum, &fetched) != S_OK || fetched != 1 || !lineNum)
+							break;
+						{
+							found_source = false;
+							found_line = false;
+							DWORD sline{};
+							CComPtr<IDiaSourceFile> srcFile;
+							CComBSTR fileName;
+							std::string convertedFileName;
+
+							if (lineNum->get_sourceFile(&srcFile) == S_OK && srcFile &&
+								srcFile->get_fileName(&fileName) == S_OK && fileName)
+							{
+								convertedFileName = ConvertBSTRToMBS(fileName);
+								found_source = true;
+							}
+
+							if (lineNum->get_lineNumber(&sline) == S_OK)
+								found_line = true;
+
+							if (found_source && found_line)
+								a_result += fmt::format(" {}:{} {}", convertedFileName, +sline ? (uint64_t)sline : 0, demangledName);
+							else if (found_source)
+								a_result += fmt::format(" {} {}", convertedFileName, demangledName);
+							else if (found_line)
+								a_result += fmt::format(" unk_:{} {}", +sline ? (uint64_t)sline : 0, demangledName);
+						}
+					}
+
+					if (!found_source && !found_line)
 					{
-						result.text += ":" + std::to_string(source.number);
-						result.hasSourceLine = true;
+						auto sRva = fmt::format("{:X}", rva);
+						bool is_annotated = demangledName.find('[') != std::string::npos;
+						if (!is_annotated)
+						{
+							if (demangledName.ends_with(sRva))
+								sRva = "";
+							else
+								sRva = "_" + sRva;
+						}
+						else
+							sRva.clear();
+
+						a_result += fmt::format(" {}{}", demangledName, sRva);
 					}
 				}
-				if (sources.status != S_OK)
-					result.issue = fmt::format("Source lines unavailable or partial (0x{:08X})", static_cast<std::uint32_t>(sources.status));
-				else if (sources.limitReached)
-					result.issue = "Source-line limit reached";
-				return result;
 			}
-		}
 
-		std::string processSymbol(IDiaSymbol* a_symbol, IDiaSession* a_session, const DWORD& a_rva, std::string_view&, uintptr_t&, std::string& a_result)
-		{
-			DWORD rva = a_rva;
-			if (rva == 0 && a_symbol)
-				(void)a_symbol->get_relativeVirtualAddress(&rva);
-			a_result = describe_symbol(a_symbol, a_session, rva).text;
+			if (a_result.empty())
+				LOG::INFO("No symbol found for {}+{:07X}"sv, a_name, a_offset);
+			else
+				LOG::INFO("Symbol returning: {}", a_result);
+
 			return a_result;
 		}
 
@@ -452,7 +444,8 @@ namespace Crash
 				errMsg = "Access denied to PDB resources";
 				break;
 			default:
-				errMsg = fmt::format("HRESULT 0x{:08X}", static_cast<std::uint32_t>(hr));
+				_com_error err(hr);
+				errMsg = CT2A(err.ErrorMessage());
 				break;
 			}
 			return errMsg;
@@ -512,21 +505,20 @@ namespace Crash
 
 			[[nodiscard]] std::string get_symbol_name(IDiaSymbol* symbol)
 			{
-				CComBSTR name;
+				BSTR name{};
 				if (symbol->get_name(&name) == S_OK && name)
 				{
 					const auto converted = ConvertBSTRToMBS(name);
+					::SysFreeString(name);  // Free BSTR to prevent memory leak
 					return demangle(converted);
 				}
 				return "";
 			}
 
-			[[nodiscard]] std::string get_type_name(IDiaSymbol* type, unsigned a_depth = 0)
+			[[nodiscard]] std::string get_type_name(IDiaSymbol* type)
 			{
 				if (!type)
 					return "<unknown>";
-				if (a_depth >= 16)
-					return "<type depth limit>";
 
 				DWORD symTag = 0;
 				if (FAILED(type->get_symTag(&symTag)))
@@ -538,7 +530,7 @@ namespace Crash
 				{
 					CComPtr<IDiaSymbol> pointee;
 					type->get_type(&pointee);
-					auto name = get_type_name(pointee, a_depth + 1);
+					auto name = get_type_name(pointee);
 					BOOL isConst = FALSE;
 					type->get_constType(&isConst);
 					if (isConst && !name.starts_with("const "))
@@ -563,7 +555,7 @@ namespace Crash
 					type->get_type(&element);
 					DWORD count = 0;
 					type->get_count(&count);
-					return fmt::format("{}[{}]", get_type_name(element, a_depth + 1), count);
+					return fmt::format("{}[{}]", get_type_name(element), count);
 				}
 				case SymTagFunctionType:
 					return "function";
@@ -620,9 +612,6 @@ namespace Crash
 			CComPtr<IDiaSession> pSession;
 			CComPtr<IDiaSymbol> globalSymbol;
 			bool com_initialized_here = false;
-			HRESULT status{ S_FALSE };
-			std::string issue;
-			std::string pdbPath;
 
 			~PdbSession()
 			{
@@ -633,216 +622,302 @@ namespace Crash
 					CoUninitialize();
 			}
 
-			bool fail(HRESULT a_status, std::string_view a_operation)
-			{
-				status = a_status;
-				issue = std::string(a_operation) + ": " + print_hr_failure(a_status);
-				return false;
-			}
-
 			// Open a PDB session for the given module
-			bool open(std::string_view a_name)
+			bool open(std::string_view a_name, uintptr_t a_offset)
 			{
-				std::filesystem::path dllPath{ utf8_to_utf16(std::string(a_name)) };
+				std::filesystem::path dllPath{ a_name };
+				std::string dll_path{ a_name };
 				if (!dllPath.has_parent_path())
-					dllPath = std::filesystem::path(sPluginPath) / dllPath;
+					dll_path = (std::filesystem::path(Crash::PDB::sPluginPath) / dllPath.filename()).string();
 
-				auto result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-				if (FAILED(result) && result != RPC_E_CHANGED_MODE)
-					return fail(result, "COM initialization");
-				com_initialized_here = SUCCEEDED(result);
+				HRESULT hr = S_OK;
 
-				const auto diaPath = std::filesystem::absolute(
-					std::filesystem::path(sPluginPath) / L"msdia140.dll");
-				result = NoRegCoCreate(diaPath.c_str(), CLSID_DiaSource, __uuidof(IDiaDataSource), reinterpret_cast<void**>(&pSource));
-				if (FAILED(result))
+				// Initialize COM
+				hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+				if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
 				{
-					pSource.Release();
-					result = CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER,
-						__uuidof(IDiaDataSource), reinterpret_cast<void**>(&pSource));
-					if (FAILED(result))
-						return fail(result, "DIA provider unavailable");
+					auto error = print_hr_failure(hr);
+					LOG::INFO("Failed to initialize COM library for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					return false;
 				}
-				if (!pSource)
-					return fail(E_UNEXPECTED, "DIA provider returned no data source");
-				const auto symcache = Settings::sSymcacheDirectory.GetValue();
-				std::vector<std::wstring> searchPaths{ std::filesystem::path(sPluginPath).wstring() };
-				std::error_code error;
-				const std::filesystem::path cachePath{ utf8_to_utf16(symcache) };
-				if (!cachePath.empty() && std::filesystem::is_directory(cachePath, error) && !error)
+				com_initialized_here = SUCCEEDED(hr);
+
+				// Load DIA data source
+				auto* msdia_dll = L"Data/F4SE/Plugins/msdia140.dll";
+				hr = NoRegCoCreate(msdia_dll, CLSID_DiaSource, __uuidof(IDiaDataSource), (void**)&pSource);
+				if (FAILED(hr))
 				{
-					searchPaths.push_back(L"cache*" + cachePath.wstring());
+					auto error = print_hr_failure(hr);
+					LOG::INFO("Failed to manually load msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
+
+					// Try registered copy
+					if (FAILED(hr = CoCreateInstance(CLSID_DiaSource, NULL, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void**)&pSource)))
+					{
+						auto error = print_hr_failure(hr);
+						LOG::INFO("Failed to load registered msdia140.dll for dll {}+{:07X}\t{}", a_name, a_offset, error);
+						return false;
+					}
 				}
 
+				// Prepare file paths
+				wchar_t wszFilename[_MAX_PATH];
+				wchar_t wszPath[_MAX_PATH];
+				std::wstring dll_path_w = utf8_to_utf16(dll_path);
+				wcsncpy(wszFilename, dll_path_w.c_str(), sizeof(wszFilename) / sizeof(wchar_t));
+				wszFilename[_MAX_PATH - 1] = L'\0';
+
+				// Get symcache config
+				std::string symcache = Settings::sSymcacheDirectory.GetValue();
+
+				// Use namespace-level atomics for shared symcache validation state
+				if (!symcacheChecked.load(std::memory_order_acquire))
+				{
+					if (!symcache.empty() && std::filesystem::exists(symcache) && std::filesystem::is_directory(symcache))
+					{
+						LOG::INFO("Symcache found at {}", symcache);
+						symcacheValid.store(true, std::memory_order_release);
+					}
+					else
+						LOG::INFO("Symcache not found at {}", symcache.empty() ? "not defined" : symcache);
+
+					symcacheChecked.store(true, std::memory_order_release);
+				}
+
+				// Build search paths
+				std::vector<std::string> searchPaths = { Crash::PDB::sPluginPath.data() };
+				if (symcacheValid.load(std::memory_order_acquire))
+					searchPaths.push_back(fmt::format(fmt::runtime("cache*{}"s), symcache.c_str()));
+
+				// Try to load PDB
 				DiaLoadLogger loadLogger;
+				bool foundPDB = false;
 				for (const auto& path : searchPaths)
 				{
-					result = pSource->loadDataForExe(dllPath.c_str(), path.c_str(), &loadLogger);
-					if (SUCCEEDED(result))
-						break;
+					std::wstring path_w = utf8_to_utf16(path);
+					wcsncpy(wszPath, path_w.c_str(), sizeof(wszPath) / sizeof(wchar_t));
+					wszPath[_MAX_PATH - 1] = L'\0';
+
+					// `path` is only a searchPath hint; DIA also searches the exe's directory and
+					// symbol paths, so the file it actually opens is reported via loadLogger below.
+					LOG::INFO("Attempting to load pdb for {}+{:07X} (searchPath {})", a_name, a_offset, path);
+					hr = pSource->loadDataForExe(wszFilename, wszPath, &loadLogger);
+					if (FAILED(hr))
+					{
+						auto error = print_hr_failure(hr);
+						LOG::INFO("Failed to open pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+						continue;
+					}
+					foundPDB = true;
+					break;
 				}
-				if (FAILED(result))
-					return fail(result, "PDB load");
-				pdbPath = utf16_to_utf8(loadLogger.openedPdb);
-				result = pSource->openSession(&pSession);
-				if (FAILED(result) || !pSession)
-					return fail(FAILED(result) ? result : E_UNEXPECTED, "DIA session");
-				status = S_OK;
+
+				if (!foundPDB)
+					return false;
+
+				if (!loadLogger.openedPdb.empty())
+					LOG::INFO("Successfully opened pdb for dll {}+{:07X} from {}", a_name, a_offset, std::filesystem::path(loadLogger.openedPdb).string());
+				else
+					LOG::INFO("Successfully opened pdb for dll {}+{:07X}", a_name, a_offset);
+
+				// Open session
+				if (FAILED(hr = pSource->openSession(&pSession)))
+				{
+					auto error = print_hr_failure(hr);
+					LOG::INFO("Failed to openSession for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					return false;
+				}
+
+				// Get global scope
+				if (FAILED(hr = pSession->get_globalScope(&globalSymbol)))
+				{
+					auto error = print_hr_failure(hr);
+					LOG::INFO("Failed to get_globalScope for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+					return false;
+				}
+
 				return true;
 			}
 		};
 
-		namespace
-		{
-			void describe_parameters(IDiaSymbol* a_function, SymbolDetails& a_result)
-			{
-				if (!a_function)
-					return;
-				CComPtr<IDiaEnumSymbols> symbols;
-				const auto status = a_function->findChildren(SymTagData, nullptr, nsNone, &symbols);
-				if (FAILED(status) || !symbols)
-				{
-					if (FAILED(status))
-						a_result.issue += fmt::format(" Parameters unavailable (0x{:08X})", static_cast<std::uint32_t>(status));
-					return;
-				}
-				std::size_t parameters{};
-				for (std::size_t examined = 0; examined < 256; ++examined)
-				{
-					CComPtr<IDiaSymbol> child;
-					ULONG fetched{};
-					const auto next = symbols->Next(1, &child, &fetched);
-					if (FAILED(next))
-					{
-						a_result.issue += fmt::format(" Parameter enumeration failed (0x{:08X})", static_cast<std::uint32_t>(next));
-						return;
-					}
-					if (fetched != 1 || !child)
-						return;
-					DWORD kind{};
-					if (child->get_dataKind(&kind) != S_OK || kind != DataIsParam)
-						continue;
-					if (parameters == 8)
-					{
-						a_result.parameters += ", ...";
-						a_result.issue += " Parameter limit reached";
-						return;
-					}
-					CComBSTR name;
-					CComPtr<IDiaSymbol> type;
-					(void)child->get_type(&type);
-					const auto paramName = child->get_name(&name) == S_OK && name ? ConvertBSTRToMBS(name) : std::string{};
-					if (parameters++ != 0)
-						a_result.parameters += ", ";
-					a_result.parameters += paramName.empty() ? get_type_name(type) : paramName + ": " + get_type_name(type);
-				}
-				a_result.issue += " Parameter enumeration budget reached";
-			}
-		}
-
-		class SymbolResolver::Impl
-		{
-		public:
-			DWORD threadId{ GetCurrentThreadId() };
-			std::mutex mutex;
-			std::unordered_map<std::string, std::unique_ptr<PdbSession>> sessions;
-		};
-
-		SymbolResolver::SymbolResolver() : m_impl(std::make_unique<Impl>()) {}
-		SymbolResolver::~SymbolResolver() = default;
-
-		SymbolDetails SymbolResolver::resolve(std::string_view a_modulePath, std::uintptr_t a_offset)
-		{
-			SymbolDetails result;
-			if (m_impl->threadId != GetCurrentThreadId())
-			{
-				result.status = RPC_E_WRONG_THREAD;
-				result.issue = "Symbol resolver belongs to another COM thread";
-				return result;
-			}
-			std::unique_lock lock{ m_impl->mutex, std::try_to_lock };
-			if (!lock.owns_lock())
-			{
-				result.status = HRESULT_FROM_WIN32(ERROR_BUSY);
-				result.issue = "Symbol resolver busy";
-				return result;
-			}
-			if (a_modulePath.empty() || a_modulePath.find('\0') != std::string_view::npos ||
-				a_offset > (std::numeric_limits<DWORD>::max)())
-			{
-				result.status = E_INVALIDARG;
-				result.issue = "Invalid module path or RVA";
-				return result;
-			}
-			auto found = m_impl->sessions.find(std::string(a_modulePath));
-			if (found == m_impl->sessions.end())
-			{
-				if (m_impl->sessions.size() >= 64)
-				{
-					result.status = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_QUOTA);
-					result.issue = "Per-report symbol session limit reached";
-					return result;
-				}
-				auto session = std::make_unique<PdbSession>();
-				(void)session->open(a_modulePath);
-				found = m_impl->sessions.emplace(std::string(a_modulePath), std::move(session)).first;
-			}
-			auto& session = *found->second;
-			result.status = session.status;
-			result.issue = session.issue;
-			result.pdbPath = session.pdbPath;
-			if (session.status != S_OK)
-				return result;
-			const auto rva = static_cast<DWORD>(a_offset);
-			CComPtr<IDiaSymbol> function;
-			auto lookupStatus = session.pSession->findSymbolByRVA(rva, SymTagFunction, &function);
-			CComPtr<IDiaSymbol> symbol = function;
-			if (!symbol)
-				lookupStatus = session.pSession->findSymbolByRVA(rva, SymTagPublicSymbol, &symbol);
-			if (!symbol)
-			{
-				result.status = FAILED(lookupStatus) ? lookupStatus : S_FALSE;
-				result.issue = FAILED(lookupStatus) ? "Symbol lookup: " + print_hr_failure(lookupStatus) : "No symbol at RVA";
-				return result;
-			}
-			result = describe_symbol(symbol, session.pSession, rva);
-			result.pdbPath = session.pdbPath;
-			describe_parameters(function, result);
-			return result;
-		}
-
+		//https://stackoverflow.com/questions/68412597/determining-source-code-filename-and-line-for-function-using-visual-studio-pdb
 		std::string pdb_details(std::string_view a_name, uintptr_t a_offset)
 		{
-			SymbolResolver resolver;
-			const auto result = resolver.resolve(a_name, a_offset);
-			return result.text.empty() ? "[symbols unavailable: " + result.issue + "]" : result.text;
+			static std::mutex sync;
+			std::lock_guard l{ sync };
+			std::string result;
+
+			// Use shared PDB session helper
+			PdbSession session;
+			if (!session.open(a_name, a_offset))
+				return result;
+
+			const auto rva = static_cast<DWORD>(a_offset);
+			HRESULT hr = S_OK;
+
+			CComPtr<IDiaEnumTables> enumTables;
+			CComPtr<IDiaEnumSymbolsByAddr> enumSymbolsByAddr;
+
+			if (FAILED(hr = session.pSession->getEnumTables(&enumTables)))
+			{
+				auto error = print_hr_failure(hr);
+				LOG::INFO("Failed to getEnumTables for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+				return result;
+			}
+
+			if (FAILED(hr = session.pSession->getSymbolsByAddr(&enumSymbolsByAddr)))
+			{
+				auto error = print_hr_failure(hr);
+				LOG::INFO("Failed to getSymbolsByAddr for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
+				return result;
+			}
+
+			CComPtr<IDiaSymbol> publicSymbol;
+			if (session.pSession->findSymbolByRVA(rva, SymTagEnum::SymTagPublicSymbol, &publicSymbol) == S_OK)
+			{
+				auto publicResult = processSymbol(publicSymbol, session.pSession, rva, a_name, a_offset, result);
+
+				// Log the public result (already demangled in processSymbol)
+				LOG::INFO("Public symbol found for {}+{:07X}: {}", a_name, a_offset, publicResult);
+
+				DWORD privateRva;
+				CComPtr<IDiaSymbol> privateSymbol;
+				if (publicSymbol->get_targetRelativeVirtualAddress(&privateRva) == S_OK &&
+					session.pSession->findSymbolByRVA(privateRva, SymTagEnum::SymTagFunction, &privateSymbol) == S_OK)
+				{
+					auto privateResult = processSymbol(privateSymbol, session.pSession, privateRva, a_name, a_offset, result);
+
+					// Log the private result (already demangled in processSymbol)
+					LOG::INFO("Private symbol found for {}+{:07X}: {}", a_name, a_offset, privateResult);
+
+					// Combine results
+					if (!privateResult.empty() && !publicResult.empty())
+						result = fmt::format("{}\t{}", privateResult, publicResult);
+					else if (!privateResult.empty())
+						result = privateResult;
+					else
+						result = publicResult;
+				}
+				else
+					result = publicResult;
+			}
+			else
+				LOG::INFO("No public symbol found for {}+{:07X}", a_name, a_offset);
+
+			return result;
 		}
 
 		std::string pdb_function_parameters(std::string_view a_name, uintptr_t a_offset)
 		{
-			SymbolResolver resolver;
-			return resolver.resolve(a_name, a_offset).parameters;
+			static std::mutex sync;
+			std::lock_guard l{ sync };
+			std::string result;
+
+			// Use shared PDB session helper
+			PdbSession session;
+			if (!session.open(a_name, a_offset))
+				return result;
+
+			const auto rva = static_cast<DWORD>(a_offset);
+			HRESULT hr = S_OK;
+
+			CComPtr<IDiaSymbol> funcSymbol;
+			if (FAILED(hr = session.pSession->findSymbolByRVA(rva, SymTagFunction, &funcSymbol)) || !funcSymbol)
+				return result;
+
+			CComPtr<IDiaEnumSymbols> enumSymbols;
+			if (FAILED(hr = funcSymbol->findChildren(SymTagData, NULL, nsNone, &enumSymbols)) || !enumSymbols)
+				return result;
+
+			std::vector<std::string> params;
+			params.reserve(8);
+
+			ULONG fetched = 0;
+			CComPtr<IDiaSymbol> child;
+			while (SUCCEEDED(enumSymbols->Next(1, &child, &fetched)) && fetched == 1)
+			{
+				DWORD dataKind = 0;
+				if (FAILED(child->get_dataKind(&dataKind)))
+				{
+					child.Release();
+					continue;
+				}
+				if (dataKind != DataIsParam)
+				{
+					child.Release();
+					continue;
+				}
+
+				BSTR name{};
+				std::string paramName;
+				if (child->get_name(&name) == S_OK && name)
+				{
+					paramName = ConvertBSTRToMBS(name);
+					::SysFreeString(name);  // Free BSTR to prevent memory leak
+				}
+
+				CComPtr<IDiaSymbol> type;
+				child->get_type(&type);
+				const auto typeName = get_type_name(type);
+				if (!paramName.empty())
+					params.push_back(fmt::format("{}: {}", paramName, typeName));
+				else
+					params.push_back(typeName);
+
+				if (params.size() >= 8)
+				{
+					params.push_back("...");
+					break;
+				}
+
+				child.Release();
+			}
+
+			if (!params.empty())
+			{
+				std::string joined;
+				for (std::size_t i = 0; i < params.size(); ++i)
+				{
+					if (i > 0)
+						joined += ", ";
+
+					joined += params[i];
+				}
+				result = joined;
+			}
+
+			return result;
 		}
 
+		// dump all symbols in Plugin directory or fakepdb for exe
+		// this was the early POC test and written first in this module
 		void dump_symbols(bool exe)
 		{
-			int retflag{};
+			// Initialize COM - handle the case where it's already initialized
+			HRESULT com_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+			bool com_initialized_here = SUCCEEDED(com_hr);
+
+			// RPC_E_CHANGED_MODE means COM is already initialized with different threading mode
+			if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE)
+			{
+				LOG::ERROR("Failed to initialize COM for symbol dumping: {}", print_hr_failure(com_hr));
+				return;
+			}
+			int retflag;
 			if (exe)
 			{
-				std::array<wchar_t, 32768> path{};
-				const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-				if (length == 0 || length >= path.size())
-				{
-					REX::ERROR("Could not obtain executable path for symbol enumeration");
-					return;
-				}
-				dumpFileSymbols(std::filesystem::path(path.data()), retflag);
+				const auto string_path = "./SkyrimVR.exe";
+				std::filesystem::path file_path{ string_path };
+				dumpFileSymbols(file_path, retflag);
 			}
 			else
 			{
 				for (const auto& elem : std::filesystem::directory_iterator(Crash::PDB::sPluginPath))
 				{
-					if (elem.is_regular_file() && _wcsicmp(elem.path().extension().c_str(), L".dll") == 0)
+					if (const auto filename =
+						elem.path().has_filename() ?
+						std::make_optional(elem.path().filename().string()) :
+						std::nullopt;
+						filename.value().ends_with("dll"))
 					{
 						dumpFileSymbols(elem.path(), retflag);
 						if (retflag == 3)
@@ -854,44 +929,77 @@ namespace Crash
 		void dumpFileSymbols(const std::filesystem::path& path, int& retflag)
 		{
 			retflag = 1;
-			PdbSession session;
-			if (!session.open(utf16_to_utf8(path.wstring())))
+			const auto filename = std::make_optional(path.filename().string());
+			LOG::INFO("Found dll {}", *filename);
+			auto dll_path = path.string();
+			auto search_path = Crash::PDB::sPluginPath.data();
+			CComPtr<IDiaDataSource> source;
+			auto hr = CoCreateInstance(CLSID_DiaSource,
+				NULL,
+				CLSCTX_INPROC_SERVER,
+				__uuidof(IDiaDataSource),
+				(void**)&source);
+			if (FAILED(hr))
 			{
-				REX::WARN("Symbol enumeration unavailable: {}", session.issue);
 				retflag = 3;
 				return;
-			}
-			CComPtr<IDiaEnumSymbolsByAddr> symbols;
-			if (FAILED(session.pSession->getSymbolsByAddr(&symbols)) || !symbols)
+			};
+
 			{
-				REX::WARN("Symbol address enumeration unavailable");
-				retflag = 3;
-				return;
-			}
-			CComPtr<IDiaSymbol> symbol;
-			if (symbols->symbolByRVA(0, &symbol) != S_OK || !symbol)
-			{
-				REX::WARN("No first symbol available");
-				retflag = 3;
-				return;
-			}
-			while (symbol)
-			{
-				DWORD rva{};
-				(void)symbol->get_relativeVirtualAddress(&rva);
-				REX::INFO("{}", describe_symbol(symbol, session.pSession, rva).text);
-				symbol.Release();
-				ULONG fetched{};
-				const auto status = symbols->Next(1, &symbol, &fetched);
-				if (FAILED(status))
+				wchar_t wszFilename[_MAX_PATH];
+				wchar_t wszPath[_MAX_PATH];
+				mbstowcs(wszFilename, dll_path.c_str(), sizeof(wszFilename) / sizeof(wszFilename[0]));
+				mbstowcs(wszPath, sPluginPath.data(), sizeof(wszPath) / sizeof(wszPath[0]));
+				hr = source->loadDataForExe(wszFilename, wszPath, NULL);
+				if (FAILED(hr))
 				{
-					REX::WARN("Symbol enumeration failed: {}", print_hr_failure(status));
 					retflag = 3;
 					return;
-				}
-				if (fetched != 1)
-					break;
+				};
+				LOG::INFO("Found pdb for dll {}", *filename);
 			}
+
+			CComPtr<IDiaSession> pSession;
+			if (FAILED(source->openSession(&pSession)))
+			{
+				retflag = 3;
+				return;
+			};
+
+			IDiaEnumSymbolsByAddr* pEnumSymbolsByAddr;
+			IDiaSymbol* pSymbol;
+			ULONG celt = 0;
+			if (FAILED(pSession->getSymbolsByAddr(&pEnumSymbolsByAddr)))
+			{
+				{
+					retflag = 3;
+					return;
+				};
+			}
+			if (FAILED(pEnumSymbolsByAddr->symbolByAddr(1, 0, &pSymbol)))
+			{
+				pEnumSymbolsByAddr->Release();
+				{
+					retflag = 3;
+					return;
+				};
+			}
+			do
+			{
+				const auto rva = 0;
+				std::string_view a_name = *filename;
+				uintptr_t a_offset = 0;
+				std::string result = "";
+				result = processSymbol(pSymbol, pSession, rva, a_name, a_offset, result);
+				LOG::INFO("{}", result);
+				pSymbol->Release();
+				if (FAILED(pEnumSymbolsByAddr->Next(1, &pSymbol, &celt)))
+				{
+					pEnumSymbolsByAddr->Release();
+					break;
+				}
+			} while (celt == 1);
+			pEnumSymbolsByAddr->Release();
 		}
 	}
 }

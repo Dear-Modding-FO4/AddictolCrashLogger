@@ -19,6 +19,9 @@ namespace Settings
 		bool fullMemoryMiniDump{ false };
 		bool crashLogWriteMiniDump{ false };
 		bool threadDumpWriteMiniDump{ false };
+		bool heapAnalysis{ false };
+		int32_t maxHeapsToCheck{ 1 };
+		int32_t maxHeapIterationsPerHeap{ 1000 };
 		bool enableThreadDumpHotkey{ false };
 
 		constexpr bool operator==(const Values&) const noexcept = default;

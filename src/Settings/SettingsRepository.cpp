@@ -42,6 +42,9 @@ namespace CrashUI
 			SettingLocation{ SettingKey::kFullMemoryMiniDump, "Debugging", "bFullMemoryMiniDump" },
 			SettingLocation{ SettingKey::kCrashLogWriteMiniDump, "Debugging", "bCrashLogWriteMiniDump" },
 			SettingLocation{ SettingKey::kThreadDumpWriteMiniDump, "Debugging", "bThreadDumpWriteMiniDump" },
+			SettingLocation{ SettingKey::kHeapAnalysis, "Debugging", "bHeapAnalysis" },
+			SettingLocation{ SettingKey::kMaxHeapsToCheck, "Debugging", "iMaxHeapsToCheck" },
+			SettingLocation{ SettingKey::kMaxHeapIterationsPerHeap, "Debugging", "iMaxHeapIterationsPerHeap" },
 			SettingLocation{ SettingKey::kEnableThreadDumpHotkey, "Hotkeys", "bEnableThreadDumpHotkey" }
 		};
 
@@ -185,6 +188,15 @@ namespace CrashUI
 					break;
 				case SettingKey::kThreadDumpWriteMiniDump:
 					success = AssignValue(a_root, location, a_values.threadDumpWriteMiniDump, present, a_error);
+					break;
+				case SettingKey::kHeapAnalysis:
+					success = AssignValue(a_root, location, a_values.heapAnalysis, present, a_error);
+					break;
+				case SettingKey::kMaxHeapsToCheck:
+					success = AssignValue(a_root, location, a_values.maxHeapsToCheck, present, a_error);
+					break;
+				case SettingKey::kMaxHeapIterationsPerHeap:
+					success = AssignValue(a_root, location, a_values.maxHeapIterationsPerHeap, present, a_error);
 					break;
 				case SettingKey::kEnableThreadDumpHotkey:
 					success = AssignValue(a_root, location, a_values.enableThreadDumpHotkey, present, a_error);
@@ -570,6 +582,16 @@ namespace CrashUI
 		std::string& a_error)
 	{
 		a_error.clear();
+		if (a_values.maxHeapsToCheck < 1)
+		{
+			a_error = "Maximum heaps to check must be at least 1.";
+			return false;
+		}
+		if (a_values.maxHeapIterationsPerHeap < 1)
+		{
+			a_error = "Maximum heap iterations must be at least 1.";
+			return false;
+		}
 		const auto checkDirectory = [&](SettingKey a_key, const std::string& a_value,
 			bool a_allowEmpty, const char* a_label) {
 			if (!a_dirty.test(Index(a_key)))
@@ -672,6 +694,15 @@ namespace CrashUI
 					break;
 				case SettingKey::kThreadDumpWriteMiniDump:
 					UpdateOwnedValue(root, location, a_baseValues.threadDumpWriteMiniDump, a_draft.threadDumpWriteMiniDump);
+					break;
+				case SettingKey::kHeapAnalysis:
+					UpdateOwnedValue(root, location, a_baseValues.heapAnalysis, a_draft.heapAnalysis);
+					break;
+				case SettingKey::kMaxHeapsToCheck:
+					UpdateOwnedValue(root, location, a_baseValues.maxHeapsToCheck, a_draft.maxHeapsToCheck);
+					break;
+				case SettingKey::kMaxHeapIterationsPerHeap:
+					UpdateOwnedValue(root, location, a_baseValues.maxHeapIterationsPerHeap, a_draft.maxHeapIterationsPerHeap);
 					break;
 				case SettingKey::kEnableThreadDumpHotkey:
 					UpdateOwnedValue(root, location, a_baseValues.enableThreadDumpHotkey, a_draft.enableThreadDumpHotkey);
@@ -825,6 +856,17 @@ namespace CrashUI
 			break;
 		case SettingKey::kThreadDumpWriteMiniDump:
 			different = m_draft.threadDumpWriteMiniDump != m_saved.threadDumpWriteMiniDump;
+			break;
+		case SettingKey::kHeapAnalysis:
+			different = m_draft.heapAnalysis != m_saved.heapAnalysis;
+			break;
+		case SettingKey::kMaxHeapsToCheck:
+			different = m_draft.maxHeapsToCheck != m_saved.maxHeapsToCheck;
+			break;
+		case SettingKey::kMaxHeapIterationsPerHeap:
+			different =
+				m_draft.maxHeapIterationsPerHeap !=
+				m_saved.maxHeapIterationsPerHeap;
 			break;
 		case SettingKey::kEnableThreadDumpHotkey:
 			different =

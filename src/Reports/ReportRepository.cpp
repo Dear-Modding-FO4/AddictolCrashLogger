@@ -274,8 +274,6 @@ namespace CrashUI
 		{
 			static constexpr std::array sections{
 				"EXCEPTION RECORD:"sv,
-				"===== ADDICTOL CRASH CORE EVIDENCE ====="sv,
-				"===== OPTIONAL ENRICHMENT ====="sv,
 				"PROBABLE CALL STACK:"sv,
 				"CALL STACK ([P]robable / [S]tack scan):"sv,
 				"CALL STACK (HYBRID):"sv,
@@ -329,36 +327,19 @@ namespace CrashUI
 		if (!stamp.ends_with(".log"))
 			return false;
 		stamp.remove_suffix(4);
-		const auto collision = stamp.find('-', 19);
-		const auto timestampStamp =
-			collision == std::string_view::npos ?
-				stamp :
-				stamp.substr(0, collision);
-		if (timestampStamp.size() != 19)
+		if (stamp.size() != 19)
 			return false;
-		for (size_t i = 0; i < timestampStamp.size(); ++i)
+		for (size_t i = 0; i < stamp.size(); ++i)
 		{
 			const auto dash = i == 4 || i == 7 || i == 10 ||
 				i == 13 || i == 16;
-			if (dash ? timestampStamp[i] != '-' :
-				(timestampStamp[i] < '0' ||
-					timestampStamp[i] > '9'))
-				return false;
-		}
-		if (collision != std::string_view::npos)
-		{
-			const auto suffix = stamp.substr(collision + 1);
-			if (suffix.empty() || suffix.size() > 3 ||
-				!std::ranges::all_of(
-					suffix,
-					[](char a_value) {
-						return a_value >= '0' && a_value <= '9';
-					}))
+			if (dash ? stamp[i] != '-' :
+				(stamp[i] < '0' || stamp[i] > '9'))
 				return false;
 		}
 		const auto number = [&](size_t a_offset, size_t a_length) {
 			unsigned value{};
-			const auto begin = timestampStamp.data() + a_offset;
+			const auto begin = stamp.data() + a_offset;
 			const auto end = begin + a_length;
 			const auto parsed = std::from_chars(begin, end, value);
 			return parsed.ec == std::errc{} && parsed.ptr == end ?
@@ -376,7 +357,7 @@ namespace CrashUI
 			!minute || *minute > 59 ||
 			!second || *second > 59)
 			return false;
-		a_timestamp.assign(timestampStamp);
+		a_timestamp.assign(stamp);
 		return true;
 	}
 

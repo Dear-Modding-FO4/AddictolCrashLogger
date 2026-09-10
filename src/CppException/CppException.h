@@ -19,7 +19,6 @@ namespace Crash
 		std::uintptr_t throwInfoAddress = 0;
 		std::uintptr_t moduleBase = 0;
 		std::optional<std::string> what;
-		bool whatIsHeuristic{ true };
 	};
 
 	bool IsCppException(const EXCEPTION_RECORD& exception) noexcept;

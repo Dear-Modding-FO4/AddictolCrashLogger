@@ -96,22 +96,6 @@ namespace Crash
 		return { log, *path };
 	}
 
-	std::shared_ptr<spdlog::logger> open_existing_log(
-		const std::filesystem::path& a_path,
-		std::string_view a_logger_name)
-	{
-		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_st>(
-			a_path.string(),
-			false);
-		auto log = std::make_shared<spdlog::logger>(
-			std::string(a_logger_name),
-			std::move(sink));
-		log->set_pattern("%v"s);
-		log->set_level(spdlog::level::trace);
-		log->flush_on(spdlog::level::off);
-		return log;
-	}
-
 	// Clean up old files in the directory matching prefix and extension
 	void clean_old_files(const std::filesystem::path& directory, std::string_view prefix, std::string_view extension, int max_count, std::string_view associated_extension)
 	{

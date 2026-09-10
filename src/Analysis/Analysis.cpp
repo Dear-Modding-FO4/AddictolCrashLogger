@@ -1,7 +1,5 @@
 #include "Analysis.h"
 
-#include "Capture/SavedContextWalker.h"
-#include "Capture/DbgHelpGate.h"
 #include "Introspection/Introspection.h"
 
 #include <Windows.h>
@@ -47,12 +45,11 @@ namespace Crash
 	{
 		const auto tib = reinterpret_cast<const ::NT_TIB*>(::NtCurrentTeb());
 		const auto base = tib ? static_cast<const std::size_t*>(tib->StackBase) : nullptr;
-		const auto limit = tib ? static_cast<const std::size_t*>(tib->StackLimit) : nullptr;
-		const auto rsp = reinterpret_cast<const std::size_t*>(a_context.Rsp);
-		if (!base || !limit || rsp < limit || rsp > base)
+		if (!base)
 		{
 			return std::nullopt;
 		}
+		const auto rsp = reinterpret_cast<const std::size_t*>(a_context.Rsp);
 		return std::span{ rsp, base };
 	}
 
@@ -77,19 +74,6 @@ namespace Crash
 		});
 		Introspection::backfill_void_pointers(analysis, regValues);
 		return std::make_pair(regs, analysis);
-	}
-
-	std::pair<RegisterInfo, std::vector<std::string>> analyze_registers(
-		const ::CONTEXT& a_context,
-		Introspection::ReadOnly::AnalysisSession& a_session)
-	{
-		const auto [regs, regValues] = get_register_info(a_context);
-		return std::make_pair(
-			regs,
-			Introspection::analyze_data(
-				regValues,
-				a_session,
-				[&](size_t i) { return std::string(regs[i].first); }));
 	}
 
 	// Analyze stack memory blocks with introspection
@@ -122,29 +106,6 @@ namespace Crash
 		}
 
 		return all_analysis_results;
-	}
-
-	std::vector<std::vector<std::string>> analyze_stack_blocks(
-		std::span<const std::size_t> stack,
-		Introspection::ReadOnly::AnalysisSession& a_session)
-	{
-		constexpr std::size_t kBlockSize = 256;
-		std::vector<std::vector<std::string>> results;
-		for (std::size_t offset = 0; offset < stack.size(); offset += kBlockSize)
-		{
-			const auto block = stack.subspan(
-				offset,
-				std::min(stack.size() - offset, kBlockSize));
-			results.push_back(Introspection::analyze_data(
-				block,
-				a_session,
-				[&](std::size_t index) {
-					return fmt::format(
-						"RSP+{:X}",
-						(offset + index) * sizeof(std::size_t));
-				}));
-		}
-		return results;
 	}
 
 	// Print registers with pre-analyzed results
@@ -355,8 +316,7 @@ namespace Crash
 	// Format a single stack frame with module info, assembly, and PDB symbols
 	std::string format_stack_frame(
 		const void* a_address,
-		const Modules::Module* a_module,
-		PDB::SymbolResolver& a_symbols)
+		const Modules::Module* a_module)
 	{
 		if (!a_module || !a_module->in_range(a_address))
 			return ""s;
@@ -366,7 +326,7 @@ namespace Crash
 			// Use the module's frame_info which includes assembly + PDB symbols
 			// This creates a boost::stacktrace::frame temporarily just for formatting
 			boost::stacktrace::frame temp_frame(a_address);
-			return a_module->frame_info(temp_frame, a_symbols);
+			return a_module->frame_info(temp_frame);
 		}
 		catch (...)
 		{
@@ -425,8 +385,7 @@ namespace Crash
 	void print_callstack(
 		spdlog::logger& a_log,
 		std::span<const void* const> a_frames,
-		std::span<const module_pointer> a_modules,
-		PDB::SymbolResolver& a_symbols)
+		std::span<const module_pointer> a_modules)
 	{
 		// Build frame data
 		std::vector<FrameData> frame_data;
@@ -437,7 +396,7 @@ namespace Crash
 			try
 			{
 				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
-				const auto frame_info = mod ? format_stack_frame(addr, mod, a_symbols) : ""s;
+				const auto frame_info = mod ? format_stack_frame(addr, mod) : ""s;
 				frame_data.push_back({ addr, mod, frame_info });
 			}
 			catch (...)
@@ -450,36 +409,65 @@ namespace Crash
 		print_callstack_impl(a_log, frame_data, "\t"sv);
 	}
 
+	namespace
+	{
+		// Reseed a reliable virtual unwind from the return address a faulting CALL pushed at [RSP].
+		// Used to recover the true caller chain of a null/near-null indirect call, where the normal
+		// unwinder dead-ends because the fault frame's RIP (=0) has no unwind metadata.
+		bool safe_reseed_unwind_from_rsp(const ::CONTEXT& a_context, void** a_out, std::size_t a_max, std::size_t& a_count) noexcept
+		{
+			a_count = 0;
+			__try {
+				// The faulting CALL pushed its return address at [RSP]; that is the real caller.
+				const auto retSlot = reinterpret_cast<void* const*>(a_context.Rsp);
+				void* const caller = *retSlot;  // may fault if RSP is invalid -> caught below
+				if (caller == nullptr || a_max == 0) {
+					return true;
+				}
+
+				// Synthesize a context positioned just past the faulting CALL and unwind from there.
+				::CONTEXT ctx = a_context;
+				ctx.Rip = reinterpret_cast<DWORD64>(caller);
+				ctx.Rsp = a_context.Rsp + sizeof(void*);
+
+				a_out[a_count++] = caller;
+
+				while (a_count < a_max && ctx.Rip != 0) {
+					DWORD64 imageBase = 0;
+					auto* const fn = ::RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+					if (fn == nullptr) {
+						break;  // leaf function / no unwind data -> stop the reliable walk
+					}
+
+					PVOID handlerData = nullptr;
+					DWORD64 establisherFrame = 0;
+					::RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx,
+						&handlerData, &establisherFrame, nullptr);
+
+					if (ctx.Rip == 0) {
+						break;
+					}
+					a_out[a_count++] = reinterpret_cast<void*>(ctx.Rip);
+				}
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;  // stack walk faulted; caller keeps whatever was collected
+			}
+		}
+	}
+
 	std::vector<const void*> recover_null_call_stack(const ::CONTEXT& a_context, std::size_t a_max_frames)
 	{
 		std::vector<const void*> result;
-		if (a_max_frames == 0)
+		if (a_max_frames == 0) {
 			return result;
-		std::uint64_t stackLimit{};
-		std::uint64_t stackBase{};
-		if (!Capture::current_thread_stack_bounds(stackLimit, stackBase))
-			return result;
-		const auto walk = Capture::walk_saved_context(
-			a_context,
-			stackLimit,
-			stackBase,
-			a_max_frames,
-			true);
-		if (!walk.nullReseeded)
-			return result;
-		result.reserve(walk.frames.size());
-		for (const auto& frame : walk.frames)
-			result.push_back(
-				reinterpret_cast<const void*>(frame.programCounter));
-		return result;
-	}
+		}
 
-	std::string format_frame_provenance(const Capture::SavedContextFrame& a_frame)
-	{
-		auto result = fmt::format(" [{}; SP=0x{:016X}]",
-			Capture::frame_provenance_name(a_frame.provenance), a_frame.stackPointer);
-		if (a_frame.sourceSlot != 0)
-			result += fmt::format(" [source slot=0x{:016X}]", a_frame.sourceSlot);
+		std::vector<void*> buffer(a_max_frames, nullptr);
+		std::size_t count = 0;
+		if (safe_reseed_unwind_from_rsp(a_context, buffer.data(), a_max_frames, count)) {
+			result.assign(buffer.begin(), buffer.begin() + count);
+		}
 		return result;
 	}
 
@@ -490,8 +478,6 @@ namespace Crash
 	{
 		std::vector<const void*> frames;
 		frames.reserve(std::min(a_max_frames, a_stack.size()));
-		if (a_max_frames == 0)
-			return frames;
 		std::unordered_set<const void*> seen;
 
 		for (const auto value : a_stack)
@@ -510,8 +496,10 @@ namespace Crash
 			const auto protect = mbi.Protect & 0xFF;
 			const bool executable = protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
 			                        protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
-			if (!executable || mbi.State != MEM_COMMIT ||
-				(mbi.Protect & PAGE_GUARD) != 0 || !seen.insert(addr).second)
+			if (!executable)
+				continue;
+
+			if (!seen.insert(addr).second)
 				continue;
 
 			frames.push_back(addr);
@@ -531,17 +519,23 @@ namespace Crash
 	{
 		std::vector<HybridFrame> frames;
 		frames.reserve(a_max_total_frames);
-		std::unordered_set<const void*> probableAddresses;
+		std::unordered_set<const void*> seen;
 
-		for (std::size_t index = 0; index < a_probable_frames.size(); ++index)
+		auto push_frame = [&](const void* a_addr, HybridFrameSource a_source)
+		{
+			if (!a_addr)
+				return;
+
+			if (seen.insert(a_addr).second)
+				frames.push_back({ a_addr, a_source });
+		};
+
+		for (const auto addr : a_probable_frames)
 		{
 			if (frames.size() >= a_max_total_frames)
 				return frames;
-			const auto addr = a_probable_frames[index];
-			if (!addr)
-				continue;
-			frames.push_back({ addr, HybridFrameSource::Probable, index });
-			probableAddresses.insert(addr);
+
+			push_frame(addr, HybridFrameSource::Probable);
 		}
 
 		if (a_stack.empty())
@@ -553,11 +547,12 @@ namespace Crash
 		{
 			if (frames.size() >= a_max_total_frames || inserted >= a_max_inserted_frames)
 				break;
-			if (probableAddresses.contains(addr))
-				continue;
 
-			frames.push_back({ addr, HybridFrameSource::StackScan });
-			++inserted;
+			if (seen.insert(addr).second)
+			{
+				frames.push_back({ addr, HybridFrameSource::StackScan });
+				++inserted;
+			}
 		}
 
 		return frames;
@@ -566,8 +561,7 @@ namespace Crash
 	void print_reconstructed_callstack(
 		spdlog::logger& a_log,
 		std::span<const std::size_t> a_stack,
-		std::span<const module_pointer> a_modules,
-		PDB::SymbolResolver& a_symbols)
+		std::span<const module_pointer> a_modules)
 	{
 		a_log.critical("RECONSTRUCTED CALL STACK (STACK SCAN):"sv);
 
@@ -585,7 +579,7 @@ namespace Crash
 			try
 			{
 				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
-				const auto frame_info = mod ? format_stack_frame(addr, mod, a_symbols) : ""s;
+				const auto frame_info = mod ? format_stack_frame(addr, mod) : ""s;
 				frame_data.push_back({ addr, mod, frame_info });
 			}
 			catch (...)
@@ -602,10 +596,8 @@ namespace Crash
 		std::span<const void* const> a_probable_frames,
 		std::span<const std::size_t> a_stack,
 		std::span<const module_pointer> a_modules,
-		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames,
-		std::size_t a_max_inserted_frames,
-		std::span<const Capture::SavedContextFrame> a_savedFrames)
+		std::size_t a_max_inserted_frames)
 	{
 		a_log.critical("CALL STACK ([P]robable / [S]tack scan):"sv);
 
@@ -615,9 +607,6 @@ namespace Crash
 			a_modules,
 			a_max_total_frames,
 			a_max_inserted_frames);
-		if (a_probable_frames.size() > a_max_total_frames)
-			a_log.critical("\tOutput limited to {} probable frames; captured {}. Stack-scan candidates omitted.",
-				a_max_total_frames, a_probable_frames.size());
 		if (frames.empty())
 		{
 			a_log.critical("\tNone found"sv);
@@ -633,13 +622,7 @@ namespace Crash
 			try
 			{
 				const auto mod = Introspection::get_module_for_pointer(frame.address, a_modules);
-				auto frame_info = mod ? format_stack_frame(frame.address, mod, a_symbols) : ""s;
-				if (frame.source == HybridFrameSource::StackScan)
-					frame_info += " [stack-scan candidate]";
-				else if (frame.probableIndex < a_savedFrames.size())
-					frame_info += format_frame_provenance(a_savedFrames[frame.probableIndex]);
-				else
-					frame_info += " [handler-stack fallback]";
+				auto frame_info = mod ? format_stack_frame(frame.address, mod) : ""s;
 				frame_data.push_back({ frame.address, mod, std::move(frame_info) });
 				source_tags.push_back(frame.source == HybridFrameSource::Probable ? 'P' : 'S');
 			}
@@ -686,22 +669,12 @@ namespace Crash
 		std::span<const void* const> a_probable_frames,
 		std::span<const std::size_t> a_stack,
 		std::span<const module_pointer> a_modules,
-		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames,
-		std::size_t a_max_inserted_frames,
-		std::span<const Capture::SavedContextFrame> a_savedFrames)
+		std::size_t a_max_inserted_frames)
 	{
 		__try
 		{
-			print_hybrid_callstack(
-				a_log,
-				a_probable_frames,
-				a_stack,
-				a_modules,
-				a_symbols,
-				a_max_total_frames,
-				a_max_inserted_frames,
-				a_savedFrames);
+			print_hybrid_callstack(a_log, a_probable_frames, a_stack, a_modules, a_max_total_frames, a_max_inserted_frames);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
@@ -718,10 +691,6 @@ namespace Crash
 	{
 		try
 		{
-			auto gate = Capture::DbgHelpGate::try_lock();
-			if (!gate.owns_lock())
-				return false;
-
 			// Create minidump file
 			const auto file = ::CreateFileW(
 				a_path.c_str(),
@@ -777,11 +746,6 @@ namespace Crash
 				nullptr);
 
 			::CloseHandle(file);
-			if (result == 0)
-			{
-				std::error_code ignored;
-				std::filesystem::remove(a_path, ignored);
-			}
 			return result != 0;
 
 		}

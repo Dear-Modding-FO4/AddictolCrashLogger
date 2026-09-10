@@ -735,8 +735,7 @@ namespace CrashUI
 			capture.settings.push_back(MakeSetting(
 				"Debugging.bThreadDumpWriteMiniDump",
 				"Thread-dump minidump",
-				"Writes a minidump from the same Process Snapshot used by the "
-				"manual thread report, before analysis.",
+				"Writes a minidump alongside manually triggered thread dumps.",
 				SettingKey::kThreadDumpWriteMiniDump,
 				&Settings::Values::threadDumpWriteMiniDump,
 				Settings::kBuiltInDefaults.threadDumpWriteMiniDump,
@@ -783,6 +782,30 @@ namespace CrashUI
 				&Settings::Values::symcacheDirectory,
 				Settings::kBuiltInDefaults.symcacheDirectory,
 				Text{ 1024, false }));
+			advanced.settings.push_back(MakeSetting(
+				"Debugging.bHeapAnalysis",
+				"Heap analysis",
+				"Enables bounded heap-allocation analysis in future reports.",
+				SettingKey::kHeapAnalysis,
+				&Settings::Values::heapAnalysis,
+				Settings::kBuiltInDefaults.heapAnalysis,
+				Checkbox{}));
+			advanced.settings.push_back(MakeSetting(
+				"Debugging.iMaxHeapsToCheck",
+				"Maximum heaps to check",
+				"Must be at least one.",
+				SettingKey::kMaxHeapsToCheck,
+				&Settings::Values::maxHeapsToCheck,
+				Settings::kBuiltInDefaults.maxHeapsToCheck,
+				signedRange(1, (std::numeric_limits<int32_t>::max)())));
+			advanced.settings.push_back(MakeSetting(
+				"Debugging.iMaxHeapIterationsPerHeap",
+				"Maximum allocations per heap",
+				"Must be at least one.",
+				SettingKey::kMaxHeapIterationsPerHeap,
+				&Settings::Values::maxHeapIterationsPerHeap,
+				Settings::kBuiltInDefaults.maxHeapIterationsPerHeap,
+				signedRange(1, (std::numeric_limits<int32_t>::max)())));
 			groups.push_back(std::move(advanced));
 			return groups;
 		}
