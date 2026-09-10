@@ -783,32 +783,6 @@ namespace CrashUI
 				&Settings::Values::symcacheDirectory,
 				Settings::kBuiltInDefaults.symcacheDirectory,
 				Text{ 1024, false }));
-			advanced.settings.push_back(MakeSetting(
-				"Debugging.bHeapAnalysis",
-				"Heap analysis (retired)",
-				"Deprecated compatibility key. Heap ownership probing is unsafe "
-				"during failures; reports use read-only memory-region "
-				"classification instead.",
-				SettingKey::kHeapAnalysis,
-				&Settings::Values::heapAnalysis,
-				Settings::kBuiltInDefaults.heapAnalysis,
-				Checkbox{}));
-			advanced.settings.push_back(MakeSetting(
-				"Debugging.iMaxHeapsToCheck",
-				"Maximum heaps (retired)",
-				"Deprecated compatibility key retained without effect.",
-				SettingKey::kMaxHeapsToCheck,
-				&Settings::Values::maxHeapsToCheck,
-				Settings::kBuiltInDefaults.maxHeapsToCheck,
-				signedRange(1, (std::numeric_limits<int32_t>::max)())));
-			advanced.settings.push_back(MakeSetting(
-				"Debugging.iMaxHeapIterationsPerHeap",
-				"Maximum allocations (retired)",
-				"Deprecated compatibility key retained without effect.",
-				SettingKey::kMaxHeapIterationsPerHeap,
-				&Settings::Values::maxHeapIterationsPerHeap,
-				Settings::kBuiltInDefaults.maxHeapIterationsPerHeap,
-				signedRange(1, (std::numeric_limits<int32_t>::max)())));
 			groups.push_back(std::move(advanced));
 			return groups;
 		}

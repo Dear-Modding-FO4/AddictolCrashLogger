@@ -37,7 +37,8 @@ Manual thread reports capture the process once with Windows Process Snapshotting
 (PSS), use captured contexts, module catalog and VA clone for analysis, and can
 write a minidump from that same HPSS before analysis. There is no per-thread
 suspension loop and no live fallback after PSS failure. Heap-allocation ownership
-probing is retired; legacy TOML keys remain accepted but have no effect.
+probing is retired; its settings are no longer shipped or exposed in the menu.
+Old custom TOML entries are ignored and left untouched.
 Manual snapshot reports require Windows 8.1 or later; unavailable or failed
 snapshot capture is reported explicitly rather than reverting to live inspection.
 

@@ -61,19 +61,6 @@ bCrashLogWriteMiniDump = false
 # Changes take effect on the next game launch.
 bThreadDumpWriteMiniDump = false
 
-# Deprecated compatibility key. Heap ownership probing is intentionally retired:
-# crash-time HeapWalk/heap locks are unsafe and snapshot VA data cannot prove heap
-# ownership. Reports use bounded memory-region classification instead.
-# The value is preserved for custom TOML compatibility but has no effect.
-bHeapAnalysis = false
-
-# Deprecated compatibility key retained without effect.
-iMaxHeapsToCheck = 1
-
-# Deprecated compatibility key retained without effect.
-iMaxHeapIterationsPerHeap = 1000
-
-
 [Hotkeys]
 
 # If enabled, Ctrl + Shift + F12 triggers one PSS-backed manual thread report.

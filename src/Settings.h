@@ -29,9 +29,6 @@ namespace Settings
 	extern REX::TOML::Bool<>	bFullMemoryMiniDump;
 	extern REX::TOML::Bool<>	bCrashLogWriteMiniDump;
 	extern REX::TOML::Bool<>	bThreadDumpWriteMiniDump;
-	extern REX::TOML::Bool<>	bHeapAnalysis;
-	extern REX::TOML::I32<>	iMaxHeapsToCheck;
-	extern REX::TOML::I32<>	iMaxHeapIterationsPerHeap;
 
 	// Hotkeys
 	extern REX::TOML::Bool<>	bEnableThreadDumpHotkey;

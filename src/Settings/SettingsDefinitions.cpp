@@ -44,15 +44,6 @@ namespace Settings
 	REX::TOML::Bool<> bThreadDumpWriteMiniDump{
 		"Debugging"sv, "bThreadDumpWriteMiniDump"sv, kBuiltInDefaults.threadDumpWriteMiniDump
 	};
-	REX::TOML::Bool<> bHeapAnalysis{
-		"Debugging"sv, "bHeapAnalysis"sv, kBuiltInDefaults.heapAnalysis
-	};
-	REX::TOML::I32<> iMaxHeapsToCheck{
-		"Debugging"sv, "iMaxHeapsToCheck"sv, kBuiltInDefaults.maxHeapsToCheck
-	};
-	REX::TOML::I32<> iMaxHeapIterationsPerHeap{
-		"Debugging"sv, "iMaxHeapIterationsPerHeap"sv, kBuiltInDefaults.maxHeapIterationsPerHeap
-	};
 
 	REX::TOML::Bool<> bEnableThreadDumpHotkey{
 		"Hotkeys"sv, "bEnableThreadDumpHotkey"sv, kBuiltInDefaults.enableThreadDumpHotkey
@@ -78,9 +69,6 @@ namespace Settings
 			.fullMemoryMiniDump = bFullMemoryMiniDump.GetValue(),
 			.crashLogWriteMiniDump = bCrashLogWriteMiniDump.GetValue(),
 			.threadDumpWriteMiniDump = bThreadDumpWriteMiniDump.GetValue(),
-			.heapAnalysis = bHeapAnalysis.GetValue(),
-			.maxHeapsToCheck = iMaxHeapsToCheck.GetValue(),
-			.maxHeapIterationsPerHeap = iMaxHeapIterationsPerHeap.GetValue(),
 			.enableThreadDumpHotkey = bEnableThreadDumpHotkey.GetValue()
 		};
 	}

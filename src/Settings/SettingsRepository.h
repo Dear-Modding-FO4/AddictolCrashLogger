@@ -33,9 +33,6 @@ namespace CrashUI
 		kFullMemoryMiniDump,
 		kCrashLogWriteMiniDump,
 		kThreadDumpWriteMiniDump,
-		kHeapAnalysis,
-		kMaxHeapsToCheck,
-		kMaxHeapIterationsPerHeap,
 		kEnableThreadDumpHotkey,
 		kCount
 	};
