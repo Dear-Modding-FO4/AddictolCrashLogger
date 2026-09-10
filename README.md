@@ -19,6 +19,28 @@ Crash logging works without the UI. The UI never uploads or deletes reports;
 Pastebin settings remain file-only, and manual capture uses the existing optional
 Ctrl+Shift+F12 hotkey.
 
+## Crash-capture foundations
+
+Fatal reports write a fixed-buffer **core evidence** prefix first (raw exception
+code, flags and parameters; original exception address; saved RIP/RSP and general
+registers; PID and TID), flush it, and then append best-effort enrichment to the
+same collision-safe report path. Symbols, modules, settings, retention and
+minidumps are deferred until the core prefix exists.
+
+Automatic crash inspection and manual thread reports share bounded, strictly
+read-only object decoding. Verified direct fields are preserved where available;
+fields that require virtual engine calls, global VM/data-handler state, handle
+lookups, or unverified layouts are printed as unavailable. Shared image/mapped
+reads keep explicit weak-provenance diagnostics.
+
+Manual thread reports capture the process once with Windows Process Snapshotting
+(PSS), use captured contexts, module catalog and VA clone for analysis, and can
+write a minidump from that same HPSS before analysis. There is no per-thread
+suspension loop and no live fallback after PSS failure. Heap-allocation ownership
+probing is retired; legacy TOML keys remain accepted but have no effect.
+Manual snapshot reports require Windows 8.1 or later; unavailable or failed
+snapshot capture is reported explicitly rather than reverting to live inspection.
+
 ### Requirements
 * [XMake](https://xmake.io) [3.0.0+]
 * C++23 Compiler (MSVC or Clang-CL)

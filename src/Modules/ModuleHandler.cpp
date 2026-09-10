@@ -158,7 +158,9 @@ namespace Crash::Modules
 
 			using super::super;
 
-			[[nodiscard]] std::string get_frame_info(const boost::stacktrace::frame& a_frame) const override
+			[[nodiscard]] std::string get_frame_info(
+				const boost::stacktrace::frame& a_frame,
+				PDB::SymbolResolver& a_symbols) const override
 			{
 				const auto offset = reinterpret_cast<std::uintptr_t>(a_frame.address()) - address();
 				const auto it = std::lower_bound(
@@ -170,8 +172,7 @@ namespace Crash::Modules
 						return a_lhs.offset >= a_rhs;
 					});
 
-				auto result = super::get_frame_info(a_frame);
-				const auto assemblyStr = assembly(a_frame.address());
+				auto result = super::get_frame_info(a_frame, a_symbols);
 				if (it != _offset2ID.rend())
 				{
 					result += fmt::format(
@@ -179,7 +180,7 @@ namespace Crash::Modules
 						it->id,
 						offset - it->offset);
 				}
-				return fmt::format("{}\t{}", result, assemblyStr);
+				return result;
 			}
 
 		private:
@@ -248,10 +249,12 @@ namespace Crash::Modules
 		};
 	}
 
-	std::string Module::frame_info(const boost::stacktrace::frame& a_frame) const
+	std::string Module::frame_info(
+		const boost::stacktrace::frame& a_frame,
+		PDB::SymbolResolver& a_symbols) const
 	{
 		assert(in_range(a_frame.address()));
-		return get_frame_info(a_frame);
+		return get_frame_info(a_frame, a_symbols);
 	}
 
 	std::string Module::assembly(const void* a_ptr) const
@@ -259,16 +262,24 @@ namespace Crash::Modules
 		// Zydis code from https://github.com/zyantific/zydis/blob/214536a814ba20d2e33d2a907198d1a329aac45c/examples/DisassembleSimple.c#L38-L63 under MIT
 
 		ZyanUSize offset = 0;
-		ZyanU8 data[8];
+		ZyanU8 data[ZYDIS_MAX_INSTRUCTION_LENGTH]{};
 		ZyanU64 runtime_address = (ZyanU64)a_ptr;
-		memcpy(data, (const void*)runtime_address, sizeof(data));
+		SIZE_T bytesRead{};
+		if (!::ReadProcessMemory(
+				::GetCurrentProcess(),
+				a_ptr,
+				data,
+				sizeof(data),
+				std::addressof(bytesRead)) ||
+			bytesRead == 0)
+			return "<instruction bytes unavailable>";
 		std::string assembly = "";
 		ZydisDisassembledInstruction instruction;
 		if (ZYAN_SUCCESS(ZydisDisassembleIntel(
 			/* machine_mode:    */ ZYDIS_MACHINE_MODE_LONG_64,
 			/* runtime_address: */ runtime_address,
 			/* buffer:          */ data + offset,
-			/* length:          */ sizeof(data) - offset,
+			/* length:          */ bytesRead - offset,
 			/* instruction:     */ &instruction))) {
 			assembly = std::format("{}", instruction.text);
 		}
@@ -314,22 +325,33 @@ namespace Crash::Modules
 		}
 	}
 
-	std::string Module::get_frame_info(const boost::stacktrace::frame& a_frame) const
+	std::string Module::get_frame_info(
+		const boost::stacktrace::frame& a_frame,
+		PDB::SymbolResolver& a_symbols) const
 	{
 		const auto offset = reinterpret_cast<std::uintptr_t>(a_frame.address()) - address();
 		const auto assembly = this->assembly(a_frame.address());
-		const auto pdbDetails = Crash::PDB::pdb_details(path(), offset);
-		const auto pdbParams = Crash::PDB::pdb_function_parameters(path(), offset);
-		if (!pdbDetails.empty())
-			return fmt::format(
-				"+{:07X}\t{} | {}{}"sv,
-				offset,
-				assembly,
-				pdbDetails,
-				pdbParams.empty() ? ""s : fmt::format(" | params: {}", pdbParams));
-		return fmt::format(
-			"+{:07X}"sv,
-			offset);
+		const auto symbols = a_symbols.resolve(path(), offset);
+		auto result = fmt::format("+{:07X}\t{}"sv, offset, assembly);
+		if (!symbols.text.empty())
+		{
+			result += fmt::format(" | {}", symbols.text);
+			if (!symbols.parameters.empty())
+				result += fmt::format(" | params: {}", symbols.parameters);
+			if (!symbols.issue.empty())
+				result += fmt::format(
+					" | symbol note: {} (HRESULT=0x{:08X})",
+					symbols.issue,
+					static_cast<std::uint32_t>(symbols.status));
+		}
+		else
+		{
+			result += fmt::format(
+				" | symbols unavailable: {} (HRESULT=0x{:08X})",
+				symbols.issue.empty() ? "no symbol details" : symbols.issue,
+				static_cast<std::uint32_t>(symbols.status));
+		}
+		return result;
 	}
 
 	auto get_loaded_modules()

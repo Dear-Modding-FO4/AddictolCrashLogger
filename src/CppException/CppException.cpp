@@ -1,5 +1,7 @@
 #include "CppException.h"
 
+#include "Capture/DbgHelpGate.h"
+#include "Introspection/ReadonlyIntrospection.h"
 #include <DbgHelp.h>
 #include <array>
 #include <cstring>
@@ -12,15 +14,14 @@ namespace Crash
 		template <typename T>
 		bool SafeRead(std::uintptr_t address, T& out) noexcept
 		{
-			__try
-			{
-				out = *reinterpret_cast<const T*>(address);
-				return true;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER)
-			{
-				return false;
-			}
+			static_assert(std::is_trivially_copyable_v<T>);
+			Introspection::ReadOnly::LiveMemoryReader reader;
+			auto result = reader.read(
+				Introspection::ReadOnly::TargetAddress(address),
+				std::span<std::byte>{
+					reinterpret_cast<std::byte*>(std::addressof(out)),
+					sizeof(out) });
+			return result.has_value();
 		}
 
 		// Try to demangle a C++ type name using UnDecorateSymbolName
@@ -37,6 +38,9 @@ namespace Crash
 					++nameStart;
 
 				std::array<char, 1024> buffer{};
+				auto gate = Capture::DbgHelpGate::try_lock();
+				if (!gate.owns_lock())
+					return std::string(mangledName);
 				const auto result = UnDecorateSymbolName(
 					nameStart,
 					buffer.data(),

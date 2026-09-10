@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Introspection/ReadonlyIntrospection.h"
+
 #include <functional>
 #include <string>
 
@@ -25,6 +27,11 @@ namespace Crash
 		[[nodiscard]] std::vector<std::string> analyze_data(
 			std::span<const std::size_t> a_data,
 			std::span<const std::unique_ptr<Modules::Module>> a_modules,
+			std::function<std::string(size_t)> a_label_generator = nullptr);
+
+		[[nodiscard]] std::vector<std::string> analyze_data(
+			std::span<const std::size_t> a_data,
+			ReadOnly::AnalysisSession& a_session,
 			std::function<std::string(size_t)> a_label_generator = nullptr);
 
 		// Backfill void* entries in analysis results with known object information

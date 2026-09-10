@@ -55,26 +55,29 @@ bFullMemoryMiniDump = false
 # Changes take effect on the next game launch.
 bCrashLogWriteMiniDump = false
 
-# If enabled, minidumps will be written alongside thread dumps.
+# If enabled, manual thread reports capture one Process Snapshot (PSS) and write
+# a minidump from that same snapshot before bounded read-only analysis.
+# Handle data is included only for this requested dump.
 # Changes take effect on the next game launch.
 bThreadDumpWriteMiniDump = false
 
-# If enabled, performs heap allocation analysis for crash pointers.
-# Changes take effect on the next game launch.
+# Deprecated compatibility key. Heap ownership probing is intentionally retired:
+# crash-time HeapWalk/heap locks are unsafe and snapshot VA data cannot prove heap
+# ownership. Reports use bounded memory-region classification instead.
+# The value is preserved for custom TOML compatibility but has no effect.
 bHeapAnalysis = false
 
-# Maximum number of heaps to check.
-# Must be at least 1. Changes take effect on the next game launch.
+# Deprecated compatibility key retained without effect.
 iMaxHeapsToCheck = 1
 
-# Maximum allocations to check per heap before stopping.
-# Must be at least 1. Changes take effect on the next game launch.
+# Deprecated compatibility key retained without effect.
 iMaxHeapIterationsPerHeap = 1000
 
 
 [Hotkeys]
 
-# If enabled, Ctrl + Shift + F12 will trigger a manual thread dump.
+# If enabled, Ctrl + Shift + F12 triggers one PSS-backed manual thread report.
+# Threads are not individually suspended or recaptured.
 # The chord is fixed in this release. Changes take effect on the next game launch.
 bEnableThreadDumpHotkey = false
 

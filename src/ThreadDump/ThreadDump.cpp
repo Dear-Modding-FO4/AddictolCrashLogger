@@ -1,420 +1,620 @@
 #include "ThreadDump/ThreadDump.h"
-#include "CommonHeader/CommonHeader.h"
 
 #include "Analysis/Analysis.h"
+#include "Capture/ProcessSnapshot.h"
+#include "Capture/SnapshotStackWalker.h"
+#include "CommonHeader/CommonHeader.h"
 #include "Introspection/Introspection.h"
-#include "Modules/ModuleHandler.h"
+#include "Introspection/ReadonlyIntrospection.h"
 #include "PDB/PdbHandler.h"
-#include "RE/C/ConsoleLog.h"
-#include "RE/S/SendHUDMessage.h"
-#include <TlHelp32.h>
-#include <filesystem>
-#include <format>
-#include <shellapi.h>
-#include <spdlog/spdlog.h>
-#include <sstream>
-#include <thread>
-#include <Windows.h>
+#include "Settings.h"
 
-#undef ERROR
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fmt/format.h>
+#include <spdlog/spdlog.h>
+#include <thread>
 
 namespace Crash
 {
-	extern std::filesystem::path crashPath;
-	// Static variables for hotkey monitoring
-	static std::atomic<bool> g_stopHotkeyThread{ false };
-	static std::jthread g_hotkeyThread;
-
-	std::optional<ThreadData> CollectThreadData(DWORD threadId, size_t index,
-		std::span<const module_pointer> a_modules, const std::string& processName, const std::filesystem::path& pluginDir)
+	namespace
 	{
-		ThreadData data{ threadId, index, {}, 0 };
+		std::atomic<bool> s_stopHotkeyThread{ false };
+		std::atomic_flag s_captureInFlight = ATOMIC_FLAG_INIT;
+		std::jthread s_hotkeyThread;
 
-		HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, threadId);
-		if (!thread)
-			return std::nullopt;
-
-		// Suspend for stable capture
-		DWORD suspendCount = SuspendThread(thread);
-		if (suspendCount == static_cast<DWORD>(-1))
+		class CaptureClaim
 		{
-			CloseHandle(thread);
-			return std::nullopt;
+		public:
+			CaptureClaim() : m_owned(!s_captureInFlight.test_and_set()) {}
+			~CaptureClaim()
+			{
+				if (m_owned)
+					s_captureInFlight.clear();
+			}
+			[[nodiscard]] explicit operator bool() const noexcept { return m_owned; }
+
+		private:
+			bool m_owned{};
+		};
+
+		[[nodiscard]] const Capture::ModuleImage* module_for(
+			std::span<const Capture::ModuleImage> a_modules,
+			std::uint64_t a_address) noexcept
+		{
+			for (const auto& module : a_modules)
+				if (module.contains(a_address))
+					return std::addressof(module);
+			return nullptr;
 		}
 
-		try
+		[[nodiscard]] std::string module_name(const Capture::ModuleImage& a_module)
 		{
-			// Get thread context
-			CONTEXT ctx{};
-			ctx.ContextFlags = CONTEXT_FULL;
-
-			if (GetThreadContext(thread, &ctx))
+			try
 			{
-				// Collect callstack modules and determine priority
+				const std::filesystem::path path(a_module.path);
+				const auto filename = path.filename().string();
+				return filename.empty() ? "<captured image>" : filename;
+			}
+			catch (...)
+			{
+				return "<captured image path unavailable>";
+			}
+		}
+
+		[[nodiscard]] std::string module_path(const Capture::ModuleImage& a_module)
+		{
+			try
+			{
+				return a_module.path.empty() ?
+					"<path unavailable>" :
+					std::filesystem::path(a_module.path).string();
+			}
+			catch (...)
+			{
+				return "<path conversion unavailable>";
+			}
+		}
+
+		[[nodiscard]] std::optional<std::string> symbol_path(
+			const Capture::ModuleImage& a_module)
+		{
+			if (a_module.path.empty())
+				return std::nullopt;
+			if (!a_module.pathIsNtDevice)
+			{
 				try
 				{
-					// Check RIP first
-					const auto rip_mod = Introspection::get_module_for_pointer(reinterpret_cast<void*>(ctx.Rip), a_modules);
-					if (rip_mod && rip_mod->in_range(reinterpret_cast<void*>(ctx.Rip)))
-					{
-						std::string ripModName(rip_mod->name().data(), rip_mod->name().size());
-						data.callstackModules.push_back(ripModName);
-						if (ripModName == processName ||
-							(ripModName.ends_with(".dll") && std::filesystem::exists(pluginDir / ripModName)))
-						{
-							data.priority = 2;  // RIP in game module
-						}
-					}
-
-					// Walk stack from captured CONTEXT's RSP
-					const auto rsp = reinterpret_cast<const std::size_t*>(ctx.Rsp);
-					constexpr size_t MAX_STACK_SCAN = 512;  // 4KB of stack
-
-					for (size_t i = 0; i < MAX_STACK_SCAN; ++i)
-					{
-						const auto addr = rsp[i];
-						const auto mod = Introspection::get_module_for_pointer(reinterpret_cast<void*>(addr), a_modules);
-						if (mod && mod->in_range(reinterpret_cast<void*>(addr)))
-						{
-							std::string modName(mod->name().data(), mod->name().size());
-							if (std::find(data.callstackModules.begin(), data.callstackModules.end(), modName) == data.callstackModules.end())
-							{
-								data.callstackModules.push_back(modName);
-								if (data.priority < 2 && (modName == processName ||
-															 (modName.ends_with(".dll") && std::filesystem::exists(pluginDir / modName))))
-								{
-									data.priority = data.priority == 0 ? 1 : data.priority;  // Any in stack, but not overriding RIP priority
-								}
-							}
-						}
-					}
+					return std::filesystem::path(a_module.path).string();
 				}
 				catch (...)
 				{
-					// Failed to walk stack, but continue
+					return std::nullopt;
 				}
 			}
-		}
-		catch (...)
-		{
-			// Exception during collection
-		}
 
-		// Resume thread
-		ResumeThread(thread);
-		CloseHandle(thread);
+			std::array<wchar_t, 512> drives{};
+			const auto driveLength = ::GetLogicalDriveStringsW(
+				static_cast<DWORD>(drives.size()),
+				drives.data());
+			if (driveLength == 0 || driveLength >= drives.size())
+				return std::nullopt;
 
-		return data;
-	}
+			for (const wchar_t* drive = drives.data();
+				 *drive != L'\0';
+				 drive += std::wcslen(drive) + 1)
+			{
+				std::array<wchar_t, 3> driveName{
+					drive[0],
+					L':',
+					L'\0'
+				};
+				std::array<wchar_t, 32768> deviceNames{};
+				const auto deviceLength = ::QueryDosDeviceW(
+					driveName.data(),
+					deviceNames.data(),
+					static_cast<DWORD>(deviceNames.size()));
+				if (deviceLength == 0)
+					continue;
 
-	void DumpSingleThread(spdlog::logger& a_log, const ThreadData& data, std::span<const module_pointer> a_modules)
-	{
-		a_log.critical("===== THREAD {} (ID: {}) ====="sv, data.index, data.id);
-
-		HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, data.id);
-		if (!thread)
-		{
-			a_log.critical("\tFailed to open thread (Error: {})"sv, GetLastError());
-			a_log.critical(""sv);
-			return;
-		}
-
-		// Suspend for stable capture
-		DWORD suspendCount = SuspendThread(thread);
-		if (suspendCount == static_cast<DWORD>(-1))
-		{
-			a_log.critical("\tFailed to suspend thread"sv);
-			CloseHandle(thread);
-			a_log.critical(""sv);
-			return;
-		}
-
-		try
-		{
-			// Get thread context
-			CONTEXT ctx{};
-			ctx.ContextFlags = CONTEXT_FULL;
-
-			if (GetThreadContext(thread, &ctx)) {
-				// Print registers WITH introspection (shared DRY code)
-				// This will show what objects/locks each register points to
-				print_registers_safe(a_log, ctx, a_modules);
-				a_log.critical(""sv);
-
-				a_log.critical("\tCALLSTACK:"sv);
-				try
+				for (const wchar_t* device = deviceNames.data();
+					 *device != L'\0';
+					 device += std::wcslen(device) + 1)
 				{
-					// Collect stack frames: RIP first, then scan stack for return addresses
-					std::vector<const void*> frames;
-					frames.reserve(65);  // RIP + up to 64 stack frames
+					const auto prefixLength = std::wcslen(device);
+					if (a_module.path.size() < prefixLength ||
+						::CompareStringOrdinal(
+							a_module.path.data(),
+							static_cast<int>(prefixLength),
+							device,
+							static_cast<int>(prefixLength),
+							TRUE) != CSTR_EQUAL ||
+						(a_module.path.size() > prefixLength &&
+						 a_module.path[prefixLength] != L'\\'))
+						continue;
 
-					// Add RIP (current instruction pointer)
-					frames.push_back(reinterpret_cast<const void*>(ctx.Rip));
-
-					// Walk stack from captured CONTEXT's RSP
-					// Scan stack memory for return addresses (limit scan to 4KB / 512 qwords)
+					auto candidate = std::wstring(driveName.data());
+					candidate.append(a_module.path.substr(prefixLength));
+					const auto attributes = ::GetFileAttributesW(
+						candidate.c_str());
+					if (attributes == INVALID_FILE_ATTRIBUTES ||
+						(attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+						continue;
 					try
 					{
-						const auto rsp = reinterpret_cast<const std::size_t*>(ctx.Rsp);
-						constexpr size_t MAX_FRAMES = 64;
-						constexpr size_t MAX_STACK_SCAN = 512;  // 4KB of stack
-
-						for (size_t i = 0; i < MAX_STACK_SCAN && frames.size() < MAX_FRAMES + 1; ++i)
-						{
-							const auto addr = rsp[i];
-							const auto mod = Introspection::get_module_for_pointer(reinterpret_cast<void*>(addr), a_modules);
-							if (mod && mod->in_range(reinterpret_cast<void*>(addr)))
-								frames.push_back(reinterpret_cast<const void*>(addr));
-						}
+						return std::filesystem::path(candidate).string();
 					}
 					catch (...)
 					{
-						// Stack scan failed, continue with just RIP
+						return std::nullopt;
 					}
-
-					// Print detailed callstack with PDB symbols and assembly (shared DRY code)
-					print_callstack(a_log, frames, a_modules);
-
-				}
-				catch (const std::exception& e)
-				{
-					a_log.critical("\t\tCallstack error: {}"sv, e.what());
-				}
-				catch (...)
-				{
-					a_log.critical("\t\tStack walk may be incomplete due to access violations"sv);
 				}
 			}
-			else
-				a_log.critical("\tFailed to get thread context (Error: {})"sv, GetLastError());
-		}
-		catch (...)
-		{
-			a_log.critical("\tException during thread dump"sv);
+			return std::nullopt;
 		}
 
-		// Resume thread
-		ResumeThread(thread);
-		CloseHandle(thread);
-		a_log.critical(""sv);
+		[[nodiscard]] std::string frame_text(
+			Capture::SnapshotOperation& a_operation,
+			const Capture::StackFrame& a_frame,
+			PDB::SymbolResolver& a_symbols)
+		{
+			const auto* module = module_for(
+				a_operation.modules(),
+				a_frame.programCounter);
+			std::string location = module ?
+				fmt::format(
+					"{}+0x{:X}",
+					module_name(*module),
+					a_frame.programCounter - module->base) :
+				"<module unavailable>";
+			std::array<std::byte, 15> instruction{};
+			auto bytes = module ?
+				a_operation.read_owned_page_cached(
+					a_frame.programCounter,
+					instruction) :
+				a_operation.read(
+				a_frame.programCounter,
+				instruction);
+			if (bytes)
+			{
+				location += " bytes=";
+				for (const auto byte : instruction)
+					location += fmt::format(
+						"{:02X}",
+						std::to_integer<unsigned>(byte));
+				location += fmt::format(
+					" provenance={}",
+					static_cast<int>(bytes->provenance));
+			}
+			else
+				location += " bytes=<unavailable>";
+			if (module)
+			{
+				const auto path = symbol_path(*module);
+				if (path)
+				{
+					const auto symbols = a_symbols.resolve(
+						*path,
+						static_cast<std::uintptr_t>(
+							a_frame.programCounter - module->base));
+					if (!symbols.text.empty())
+					{
+						location += fmt::format(
+							" | {}",
+							symbols.text);
+						if (!symbols.parameters.empty())
+							location += fmt::format(
+								" | params: {}",
+								symbols.parameters);
+						if (!symbols.issue.empty())
+							location += fmt::format(
+								" | symbol note: {} (HRESULT=0x{:08X})",
+								symbols.issue,
+								static_cast<std::uint32_t>(
+									symbols.status));
+					}
+					else
+						location += fmt::format(
+							" | symbols unavailable: {} (HRESULT=0x{:08X})",
+							symbols.issue.empty() ?
+								"no symbol details" :
+								symbols.issue,
+							static_cast<std::uint32_t>(
+								symbols.status));
+				}
+				else
+					location += module->pathIsNtDevice ?
+						" | symbols unavailable: NT device path has no verified DOS mapping" :
+						" | symbols unavailable: module path unavailable";
+			}
+			return location;
+		}
+
+		[[nodiscard]] int thread_priority(
+			const Capture::CapturedThread& a_thread,
+			std::span<const Capture::ModuleImage> a_modules,
+			std::string_view a_processName)
+		{
+			const auto* module = module_for(a_modules, a_thread.context.Rip);
+			if (!module)
+				return 0;
+			const auto name = module_name(*module);
+			if (_stricmp(name.c_str(), std::string(a_processName).c_str()) == 0)
+				return 2;
+			return name.ends_with(".dll") || name.ends_with(".DLL") ? 1 : 0;
+		}
+
+		void write_thread(
+			spdlog::logger& a_log,
+			const Capture::CapturedThread& a_thread,
+			std::size_t a_index,
+			Capture::ProcessSnapshot& a_snapshot,
+			Capture::SnapshotOperation& a_operation,
+			Introspection::ReadOnly::AnalysisSession& a_analysis,
+			PDB::SymbolResolver& a_symbols)
+		{
+			a_log.critical(
+				"===== THREAD {} (ID: {}){} =====",
+				a_index,
+				a_thread.threadId,
+				a_thread.threadId == ::GetCurrentThreadId() ?
+					" [CAPTURE MONITOR]" :
+					"");
+			a_log.critical(
+				"\tCaptured RIP=0x{:016X} RSP=0x{:016X} TEB=0x{:016X}",
+				a_thread.context.Rip,
+				a_thread.context.Rsp,
+				a_thread.tebAddress);
+			if (!a_thread.hasStackBounds)
+				a_log.critical("\tStack bounds: <unavailable from captured TEB>");
+			else
+				a_log.critical(
+					"\tStack bounds: [0x{:016X}, 0x{:016X})",
+					a_thread.stackLimit,
+					a_thread.stackBase);
+
+			const auto [registers, values] = get_register_info(a_thread.context);
+			const auto decodedRegisters = Introspection::analyze_data(
+				values,
+				a_analysis,
+				[&](std::size_t a_register) {
+					return std::string(registers[a_register].first);
+				});
+			a_log.critical("\tREGISTERS (READ-ONLY SNAPSHOT DECODING):");
+			for (std::size_t index = 0; index < registers.size(); ++index)
+				a_log.critical(
+					"\t\t{} 0x{:016X} {}",
+					registers[index].first,
+					registers[index].second,
+					decodedRegisters[index]);
+
+			Capture::SnapshotStackWalker walker;
+			const auto walk = walker.walk(a_snapshot, a_thread, 128);
+			a_log.critical(
+				"\tCALLSTACK: status={} detail=\"{}\" frames={} ownedImageBytes={} weakImageReads={}",
+				static_cast<int>(walk.status),
+				walk.detail,
+				walk.frames.size(),
+				walk.instrumentation.ownedMetadataBytes,
+				walk.instrumentation.weakMetadataReads);
+			for (std::size_t index = 0; index < walk.frames.size(); ++index)
+			{
+				const auto& frame = walk.frames[index];
+				a_log.critical(
+					"\t\t[{}] PC=0x{:016X} SP=0x{:016X} {}",
+					index,
+					frame.programCounter,
+					frame.stackPointer,
+					frame_text(a_operation, frame, a_symbols));
+			}
+
+			if (a_thread.hasStackBounds)
+			{
+				const auto available = static_cast<std::size_t>(
+					std::min<std::uint64_t>(
+						a_thread.stackBase - a_thread.context.Rsp,
+						64u * 1024u));
+				std::vector<std::size_t> stack(available / sizeof(std::size_t));
+				auto stackRead = a_operation.read(
+					a_thread.context.Rsp,
+					std::span<std::byte>{
+						reinterpret_cast<std::byte*>(stack.data()),
+						stack.size() * sizeof(std::size_t) });
+				if (stackRead)
+				{
+					const auto decoded = Introspection::analyze_data(
+						stack,
+						a_analysis,
+						[](std::size_t a_index) {
+							return fmt::format(
+								"RSP+{:X}",
+								a_index * sizeof(std::size_t));
+						});
+					a_log.critical(
+						"\tSTACK OBJECT CANDIDATES (bounded {} bytes, provenance={}):",
+						stackRead->bytesRead,
+						static_cast<int>(stackRead->provenance));
+					std::size_t emitted{};
+					for (std::size_t index = 0;
+						index < decoded.size() && emitted < 64;
+						++index)
+					{
+						if (decoded[index].empty() ||
+							decoded[index].starts_with("(void*)"))
+							continue;
+						a_log.critical(
+							"\t\tRSP+{:04X} 0x{:016X} {}",
+							index * sizeof(std::size_t),
+							stack[index],
+							decoded[index]);
+						++emitted;
+					}
+					if (emitted == 64)
+						a_log.critical("\t\t<output budget reached>");
+				}
+				else
+					a_log.critical(
+						"\tSTACK: <unavailable: {} ({})>",
+						stackRead.error().message,
+						stackRead.error().systemError);
+			}
+			a_log.critical("");
+		}
 	}
 
 	void WriteAllThreadsDump()
 	{
+		CaptureClaim claim;
+		if (!claim)
+		{
+			REX::WARN("Manual thread capture is already in progress"sv);
+			return;
+		}
+
 		try
 		{
-			// Create log file
-			auto [log, logPath] = get_timestamped_log("threaddump-"sv, "thread dump"s);
+			auto [log, logPath] =
+				get_timestamped_log("threaddump-"sv, "thread dump"s);
+			log_common_header_info(
+				*log,
+				"THREAD DUMP (PSS SNAPSHOT)",
+				"TIME:"sv);
 
-			// Clean up old thread dumps
-			clean_old_files(logPath.parent_path(), "threaddump-"sv, ".log", Settings::iMaxCrashLogs.GetValue(), ".dmp");
-			clean_old_files(logPath.parent_path(), "threaddump-"sv, ".dmp", Settings::iMaxMiniDumps.GetValue());
-
-			log_common_header_info(*log, "THREAD DUMP (Manual Trigger)", "TIME:"sv);
-
-			// Get loaded modules
-			const auto modules = Modules::get_loaded_modules();
-			const std::span cmodules{ modules.begin(), modules.end() };
-
-			// Get process name and plugin dir for heuristics
-			std::filesystem::path exePath = REX::FModule::GetExecutingModule().GetFileName();
-			std::string processName = exePath.string();
-			std::filesystem::path pluginDir{ Crash::PDB::sPluginPath };
-
-			// Enumerate all threads
-			HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-			if (snapshot == INVALID_HANDLE_VALUE)
+			const auto api = Capture::PssApi::load();
+			if (!api)
 			{
-				log->critical("Failed to create thread snapshot"sv);
+				log->critical(
+					"PSS CAPTURE UNAVAILABLE: {} ({})",
+					api.error().message,
+					api.error().systemError);
 				log->flush();
+				REX::ERROR(
+					"Manual thread capture unavailable: {} ({})"sv,
+					api.error().message,
+					api.error().systemError);
 				return;
 			}
 
-			THREADENTRY32 te{};
-			te.dwSize = sizeof(te);
-
-			DWORD currentProcessId = GetCurrentProcessId();
-			DWORD currentThreadId = GetCurrentThreadId();
-			std::vector<DWORD> threadIds;
-
-			if (Thread32First(snapshot, &te))
+			const bool writeDump = Settings::bThreadDumpWriteMiniDump.GetValue();
+			auto snapshotResult = Capture::ProcessSnapshot::capture(
+				*api,
+				Capture::CaptureOptions{ .captureHandleData = writeDump });
+			if (!snapshotResult)
 			{
-				do
-				{
-					if (te.th32OwnerProcessID == currentProcessId)
-						threadIds.push_back(te.th32ThreadID);
-				} while (Thread32Next(snapshot, &te));
+				log->critical(
+					"PSS CAPTURE FAILED: {} ({})",
+					snapshotResult.error().message,
+					snapshotResult.error().systemError);
+				log->critical("No live-process fallback was attempted.");
+				log->flush();
+				REX::ERROR(
+					"Manual thread capture failed: {} ({})"sv,
+					snapshotResult.error().message,
+					snapshotResult.error().systemError);
+				return;
 			}
-			CloseHandle(snapshot);
+			auto snapshot = std::move(*snapshotResult);
 
-			log->critical("Total Threads: {}"sv, threadIds.size());
-			log->critical(""sv);
-
-			// Collect thread data
-			std::vector<ThreadData> threadDataList;
-			for (size_t i = 0; i < threadIds.size(); ++i)
+			bool minidumpWritten{};
+			if (writeDump)
 			{
-				if (threadIds[i] == currentThreadId)
-				{
-					// Skip current thread for now, handle separately
-					continue;
-				}
-
-				auto data = CollectThreadData(threadIds[i], i + 1, cmodules, processName, pluginDir);
-				if (data)
-					threadDataList.push_back(*data);
-			}
-
-			// Sort threads: by priority descending (2 > 1 > 0), then by index
-			std::sort(threadDataList.begin(), threadDataList.end(),
-				[](const ThreadData& a, const ThreadData& b)
-				{
-					if (a.priority != b.priority) {
-						return a.priority > b.priority;
-					}
-					return a.index < b.index;
-				});
-
-			// Dump sorted threads
-			for (const auto& data : threadDataList)
-			{
-				DumpSingleThread(*log, data, cmodules);
-			}
-
-			// Handle current thread last
-			size_t currentIndex = 0;
-			for (size_t i = 0; i < threadIds.size(); ++i)
-			{
-				if (threadIds[i] == currentThreadId)
-				{
-					currentIndex = i + 1;
-					break;
-				}
-			}
-			log->critical("===== THREAD {} (ID: {}) [CURRENT THREAD] ====="sv, currentIndex, currentThreadId);
-			log->critical(""sv);
-
-			log->flush();
-
-			// Write minidump if requested
-			bool minidumpWritten = false;
-			if (Settings::bThreadDumpWriteMiniDump.GetValue())
-			{
-				try
-				{
-					auto dumpPath = logPath;
-					dumpPath.replace_extension(".dmp");
-					if (write_minidump(dumpPath))
-					{
-						log->critical("Minidump written to: {}", dumpPath.string());
-						log->flush();
-						minidumpWritten = true;
-					}
-					else
-					{
-						log->critical("Failed to write minidump to: {}", dumpPath.string());
-						log->flush();
-					}
-				}
-				catch (...)
-				{
-					log->critical("Exception while writing minidump");
-					log->flush();
-				}
-			}
-
-			std::string message{ "Thread dump written to: " };
-			message.append(logPath.string());
-			if (minidumpWritten)
-			{
-				message.append("\nMinidump: ");
 				auto dumpPath = logPath;
 				dumpPath.replace_extension(".dmp");
-				message.append(dumpPath.string());
+				auto dumpType = static_cast<MINIDUMP_TYPE>(
+					MiniDumpWithThreadInfo |
+					MiniDumpWithHandleData |
+					MiniDumpWithUnloadedModules);
+				if (Settings::bFullMemoryMiniDump.GetValue())
+					dumpType = static_cast<MINIDUMP_TYPE>(
+						dumpType | MiniDumpWithFullMemory);
+				const auto dump = snapshot.write_minidump(dumpPath, dumpType);
+				if (dump)
+				{
+					minidumpWritten = true;
+					log->critical(
+						"Same-HPSS minidump written before analysis: {}",
+						dumpPath.string());
+				}
+				else
+					log->critical(
+						"Same-HPSS minidump failed: {} ({})",
+						dump.error().message,
+						dump.error().systemError);
+				log->flush();
 			}
 
-			RE::ConsoleLog::GetSingleton()->PrintLine(message.c_str());
-			LOG::INFO("{}", message);
+			auto operationResult = snapshot.reader().begin_operation(
+				16u * 1024u * 1024u);
+			if (!operationResult)
+			{
+				log->critical(
+					"ANALYSIS SESSION FAILED: {} ({})",
+					operationResult.error().message,
+					operationResult.error().systemError);
+				log->flush();
+				return;
+			}
+			auto operation = std::move(*operationResult);
+			auto moduleRanges =
+				Introspection::ReadOnly::snapshot_module_ranges(operation);
+			Introspection::ReadOnly::SnapshotMemoryReader reader(operation);
+			const auto version =
+				REX::FModule::GetExecutingModule().GetFileVersion();
+			Introspection::ReadOnly::AnalysisSession analysis(
+				reader,
+				moduleRanges,
+				Introspection::ReadOnly::runtime_profile(
+					version[0],
+					version[1],
+					version[2],
+					version[3]),
+				Introspection::ReadOnly::AnalysisBudgets{
+					.maximumReads = 24'000,
+					.maximumBytes = 4u * 1024u * 1024u,
+					.maximumObjects = 2'000,
+					.maximumDepth = 8,
+					.maximumStringBytes = 512
+				});
+			PDB::SymbolResolver symbolResolver;
 
-			// Auto-open thread dump log if enabled
+			std::vector<const Capture::CapturedThread*> ordered;
+			ordered.reserve(operation.threads().size());
+			for (const auto& thread : operation.threads())
+				ordered.push_back(std::addressof(thread));
+			std::string processName;
+			if (!moduleRanges.empty())
+				processName = moduleRanges.front().name;
+			std::stable_sort(
+				ordered.begin(),
+				ordered.end(),
+				[&](const auto* a_left, const auto* a_right) {
+					return thread_priority(
+							   *a_left,
+							   operation.modules(),
+							   processName) >
+					       thread_priority(
+							   *a_right,
+							   operation.modules(),
+							   processName);
+				});
+
+			log->critical(
+				"Captured Threads: {} (single HPSS, no suspension loop or recapture)",
+				ordered.size());
+			log->critical(
+				"Captured Modules: {} (catalog built from captured image VA)",
+				operation.modules().size());
+			for (const auto& module : operation.modules())
+			{
+				log->critical(
+					"\t0x{:016X}-0x{:016X} {}{}{}",
+					module.base,
+					module.base + module.size,
+					module_path(module),
+					module.pathIsNtDevice ? " [NT device path]" : "",
+					module.metadataPartial ?
+						" [partial unwind metadata]" :
+						"");
+				if (module.metadataPartial && !module.metadataStatus.empty())
+					log->critical("\t\t{}", module.metadataStatus);
+			}
+			log->critical("");
+			for (std::size_t index = 0; index < ordered.size(); ++index)
+				write_thread(
+					*log,
+					*ordered[index],
+					index + 1,
+					snapshot,
+					operation,
+					analysis,
+					symbolResolver);
+
+			const auto& diagnostics = analysis.diagnostics();
+			log->critical(
+				"READ-ONLY ANALYSIS STATUS: reads={} bytes={} objects={} weakReads={} unavailableFields={}",
+				diagnostics.reads,
+				diagnostics.bytes,
+				diagnostics.objects,
+				diagnostics.weakReads,
+				diagnostics.unavailableFields);
+			if (diagnostics.readBudgetExceeded ||
+				diagnostics.byteBudgetExceeded ||
+				diagnostics.objectBudgetExceeded)
+				log->critical("READ-ONLY ANALYSIS STATUS: PARTIAL (budget reached)");
+			log->flush();
+
+			clean_old_files(
+				logPath.parent_path(),
+				"threaddump-"sv,
+				".log",
+				Settings::iMaxCrashLogs.GetValue(),
+				".dmp");
+			clean_old_files(
+				logPath.parent_path(),
+				"threaddump-"sv,
+				".dmp",
+				Settings::iMaxMiniDumps.GetValue());
+
+			LOG::INFO(
+				"Manual snapshot thread report written to {}{}",
+				logPath.string(),
+				minidumpWritten ? " with same-HPSS minidump" : "");
 			auto_open_log(logPath);
-
 		}
-		catch (const std::exception& e)
+		catch (const std::exception& exception)
 		{
-			LOG::ERROR("Failed to write thread dump: {}"sv, e.what());
+			REX::ERROR(
+				"Manual snapshot thread report failed: {}"sv,
+				exception.what());
 		}
 		catch (...)
 		{
-			LOG::ERROR("Failed to write thread dump: unknown error"sv);
+			REX::ERROR("Manual snapshot thread report failed: unknown error"sv);
 		}
 	}
 
 	void HotkeyMonitorThreadFunction()
 	{
-		bool wasPressed = false;
-
-		while (!g_stopHotkeyThread)
+		bool wasPressed{};
+		while (!s_stopHotkeyThread)
 		{
-			// Check if all keys are pressed
 			bool allPressed = true;
-			for (int vk : Settings::hotkeyThreadDump)
-			{
-				if (!(GetAsyncKeyState(vk) & 0x8000))
-				{
-					allPressed = false;
-					break;
-				}
-			}
-
+			for (const int key : Settings::hotkeyThreadDump)
+				allPressed = allPressed && (::GetAsyncKeyState(key) & 0x8000) != 0;
 			if (allPressed && !wasPressed)
 			{
-				// Rising edge - keys just pressed
 				wasPressed = true;
-
-				try
-				{
-					WriteAllThreadsDump();
-				}
-				catch (...)
-				{
-					LOG::ERROR("Failed to write thread dump"sv);
-				}
+				WriteAllThreadsDump();
 			}
 			else if (!allPressed)
-			{
 				wasPressed = false;
-			}
-
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		}
 	}
 
 	void StartHotkeyMonitoring()
 	{
-		// Only create thread if feature is enabled AND hotkey is configured
 		if (!Settings::bEnableThreadDumpHotkey.GetValue())
 		{
 			REX::INFO("Thread dump hotkey disabled"sv);
 			return;
 		}
-
 		if (Settings::hotkeyThreadDump.empty())
 		{
-			REX::INFO("Thread dump hotkey not configured, monitoring thread not created"sv);
+			REX::INFO("Thread dump hotkey not configured"sv);
 			return;
 		}
-
-		g_stopHotkeyThread = false;
-		g_hotkeyThread = std::jthread(HotkeyMonitorThreadFunction);
-		REX::INFO("Thread dump hotkey monitoring started (Ctrl+Shift+F12)"sv);
+		s_stopHotkeyThread = false;
+		s_hotkeyThread = std::jthread(HotkeyMonitorThreadFunction);
+		REX::INFO("PSS thread dump hotkey monitoring started"sv);
 	}
 
 	void StopHotkeyMonitoring()
 	{
-		g_stopHotkeyThread = true;
-		if (g_hotkeyThread.joinable())
-			g_hotkeyThread.join();
+		s_stopHotkeyThread = true;
+		if (s_hotkeyThread.joinable())
+			s_hotkeyThread.join();
 	}
-
-}  // namespace Crash
+}

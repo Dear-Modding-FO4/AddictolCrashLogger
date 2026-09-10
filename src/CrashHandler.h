@@ -11,6 +11,10 @@ namespace Crash
 	{
 		class Module;
 	}
+	namespace PDB
+	{
+		class SymbolResolver;
+	}
 
 	class Callstack
 	{
@@ -19,14 +23,20 @@ namespace Crash
 		// function-pointer calls by reseeding the unwind from [RSP]; pass it when available.
 		Callstack(const ::_EXCEPTION_RECORD& a_except, const ::_CONTEXT* a_context = nullptr);
 
-		void print(spdlog::logger& a_log, std::span<const std::unique_ptr<Modules::Module>> a_modules) const;
+		void print(
+			spdlog::logger& a_log,
+			std::span<const std::unique_ptr<Modules::Module>> a_modules,
+			PDB::SymbolResolver& a_symbols) const;
 
 		// Get the throw location for C++ exceptions (frame after KERNELBASE/VCRUNTIME)
 		// Returns empty string if not found
-		[[nodiscard]] std::string get_throw_location(std::span<const std::unique_ptr<Modules::Module>> a_modules) const;
+		[[nodiscard]] std::string get_throw_location(
+			std::span<const std::unique_ptr<Modules::Module>> a_modules,
+			PDB::SymbolResolver& a_symbols) const;
 
 		[[nodiscard]] std::vector<std::string> get_frame_info_strings(
 			std::span<const std::unique_ptr<Modules::Module>> a_modules,
+			PDB::SymbolResolver& a_symbols,
 			std::size_t a_max_frames = 50) const;
 
 		[[nodiscard]] std::vector<const void*> get_frame_addresses(std::size_t a_max_frames = 500) const;
@@ -38,7 +48,8 @@ namespace Crash
 
 		void print_probable_callstack(
 			spdlog::logger& a_log,
-			std::span<const std::unique_ptr<Modules::Module>> a_modules) const;
+			std::span<const std::unique_ptr<Modules::Module>> a_modules,
+			PDB::SymbolResolver& a_symbols) const;
 
 		void print_raw_callstack(spdlog::logger& a_log) const;
 

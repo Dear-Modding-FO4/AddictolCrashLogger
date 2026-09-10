@@ -582,16 +582,9 @@ namespace CrashUI
 		std::string& a_error)
 	{
 		a_error.clear();
-		if (a_values.maxHeapsToCheck < 1)
-		{
-			a_error = "Maximum heaps to check must be at least 1.";
-			return false;
-		}
-		if (a_values.maxHeapIterationsPerHeap < 1)
-		{
-			a_error = "Maximum heap iterations must be at least 1.";
-			return false;
-		}
+		// Deprecated heap-inspection compatibility keys are intentionally not
+		// validated. They are preserved when saving custom TOML but have no
+		// runtime effect because crash-time heap ownership probing is retired.
 		const auto checkDirectory = [&](SettingKey a_key, const std::string& a_value,
 			bool a_allowEmpty, const char* a_label) {
 			if (!a_dirty.test(Index(a_key)))

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Introspection/ReadonlyIntrospection.h"
 #include "Modules/ModuleHandler.h"
 
 namespace spdlog
@@ -9,6 +10,11 @@ namespace spdlog
 
 namespace Crash
 {
+	namespace PDB
+	{
+		class SymbolResolver;
+	}
+
 	// Shared data structures for register and stack analysis
 
 	// Register information (name + value pairs)
@@ -31,12 +37,18 @@ namespace Crash
 	[[nodiscard]] std::pair<RegisterInfo, std::vector<std::string>> analyze_registers(
 		const ::CONTEXT& a_context,
 		std::span<const module_pointer> a_modules);
+	[[nodiscard]] std::pair<RegisterInfo, std::vector<std::string>> analyze_registers(
+		const ::CONTEXT& a_context,
+		Introspection::ReadOnly::AnalysisSession& a_session);
 
 	// Analyze stack memory blocks with introspection
 	// Returns: vector of blocks, each block is a vector of analysis strings
 	[[nodiscard]] std::vector<std::vector<std::string>> analyze_stack_blocks(
 		std::span<const std::size_t> stack,
 		std::span<const module_pointer> a_modules);
+	[[nodiscard]] std::vector<std::vector<std::string>> analyze_stack_blocks(
+		std::span<const std::size_t> stack,
+		Introspection::ReadOnly::AnalysisSession& a_session);
 
 	// Print registers with introspection
 	void print_registers(
@@ -107,7 +119,8 @@ namespace Crash
 	// Returns formatted string like: "+0x123456\tmov rax, rbx | FunctionName at file.cpp:42"
 	[[nodiscard]] std::string format_stack_frame(
 		const void* a_address,
-		const Modules::Module* a_module);
+		const Modules::Module* a_module,
+		PDB::SymbolResolver& a_symbols);
 
 	// Generic frame data for unified callstack printing
 	struct FrameData
@@ -128,7 +141,8 @@ namespace Crash
 	void print_callstack(
 		spdlog::logger& a_log,
 		std::span<const void* const> a_frames,
-		std::span<const module_pointer> a_modules);
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols);
 
 	// Recover the real caller chain of a null/near-null indirect call (execute access violation at
 	// RIP≈0). The faulting CALL pushed its return address at [RSP], which has valid unwind metadata,
@@ -168,7 +182,8 @@ namespace Crash
 	void print_reconstructed_callstack(
 		spdlog::logger& a_log,
 		std::span<const std::size_t> a_stack,
-		std::span<const module_pointer> a_modules);
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols);
 
 	// Print a hybrid callstack (probable frames + stack scan)
 	void print_hybrid_callstack(
@@ -176,6 +191,7 @@ namespace Crash
 		std::span<const void* const> a_probable_frames,
 		std::span<const std::size_t> a_stack,
 		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames = 128,
 		std::size_t a_max_inserted_frames = 64);
 
@@ -184,6 +200,7 @@ namespace Crash
 		std::span<const void* const> a_probable_frames,
 		std::span<const std::size_t> a_stack,
 		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames = 128,
 		std::size_t a_max_inserted_frames = 64);
 

@@ -1,6 +1,8 @@
 ﻿#include "CrashHandler.h"
 
 #include "Analysis/Analysis.h"
+#include "Capture/CoreEvidence.h"
+#include "Capture/SavedContextWalker.h"
 #include "CommonHeader/CommonHeader.h"
 #include "CppException/CppException.h"
 #include "Introspection/Introspection.h"
@@ -97,7 +99,6 @@ namespace Crash
 
 	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except, const ::CONTEXT* a_context)
 	{
-		// Self-heal for a null / near-null EXECUTE access violation
 		const auto exceptionIp = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
 		const bool isNullCall =
 			a_except.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
@@ -105,21 +106,28 @@ namespace Crash
 			a_except.ExceptionInformation[0] == 8 &&  // execute
 			exceptionIp < 0x10000;
 
-		if (isNullCall && a_context)
+		if (a_context)
 		{
-			const auto recovered = recover_null_call_stack(*a_context);
-			if (!recovered.empty())
+			std::uint64_t stackLimit{};
+			std::uint64_t stackBase{};
+			if (Capture::current_thread_stack_bounds(stackLimit, stackBase))
 			{
-				_capturedFrames.clear();
-				_capturedFrames.reserve(recovered.size());
-
-				for (const auto addr : recovered)
+				const auto savedWalk = Capture::walk_saved_context(
+					*a_context,
+					stackLimit,
+					stackBase,
+					500,
+					isNullCall);
+				if (!savedWalk.frames.empty())
 				{
-					_capturedFrames.emplace_back(addr);
+					_capturedFrames.clear();
+					_capturedFrames.reserve(savedWalk.frames.size());
+					for (const auto& frame : savedWalk.frames)
+						_capturedFrames.emplace_back(
+							reinterpret_cast<const void*>(frame.programCounter));
+					_frames = std::span(_capturedFrames);
+					return;
 				}
-
-				_frames = std::span(_capturedFrames);
-				return;
 			}
 		}
 
@@ -170,11 +178,14 @@ namespace Crash
 		}
 	}
 
-	void Callstack::print(spdlog::logger& a_log, std::span<const module_pointer> a_modules) const
+	void Callstack::print(
+		spdlog::logger& a_log,
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols) const
 	{
 		__try
 		{
-			print_probable_callstack(a_log, a_modules);
+			print_probable_callstack(a_log, a_modules, a_symbols);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
@@ -182,7 +193,9 @@ namespace Crash
 		}
 	}
 
-	std::string Callstack::get_throw_location(std::span<const module_pointer> a_modules) const
+	std::string Callstack::get_throw_location(
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols) const
 	{
 		// For C++ exceptions, the throw site is typically:
 		// frame[0] = KERNELBASE.dll (RaiseException)
@@ -214,15 +227,12 @@ namespace Crash
 						continue;
 					}
 
-					// Found the throw site - get detailed info
-					const auto frameAddr = reinterpret_cast<std::uintptr_t>(addr);
-					const auto pdbDetails = Crash::PDB::pdb_details(mod->path(), frameAddr - mod->address());
-
-					if (!pdbDetails.empty())
-						return pdbDetails;
-					else
-						// No PDB, return module+offset
-						return fmt::format("{}+{:07X}", mod->name(), frameAddr - mod->address());
+					// Found the throw site. Reuse the report's resolver so the
+					// module's bounded DIA session can serve every frame.
+					return fmt::format(
+						"{}{}",
+						mod->name(),
+						mod->frame_info(frame, a_symbols));
 				}
 			}
 		}
@@ -234,7 +244,10 @@ namespace Crash
 		return "";
 	}
 
-	std::vector<std::string> Callstack::get_frame_info_strings(std::span<const module_pointer> a_modules, std::size_t a_max_frames) const
+	std::vector<std::string> Callstack::get_frame_info_strings(
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols,
+		std::size_t a_max_frames) const
 	{
 		std::vector<std::string> results;
 		const auto frame_count = std::min(_frames.size(), a_max_frames);
@@ -248,7 +261,7 @@ namespace Crash
 				const auto addr = frame.address();
 				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
 				if (mod)
-					results.push_back(fmt::format("{}{}", mod->name(), mod->frame_info(frame)));
+					results.push_back(fmt::format("{}{}", mod->name(), mod->frame_info(frame, a_symbols)));
 				else
 					results.push_back("<unknown>");
 			}
@@ -292,7 +305,10 @@ namespace Crash
 		return "\t[{:>"s + get_size_string(_frames.size()) + "}] 0x{:012X} {:>"s + fmt::to_string(a_nameWidth) + "}{}"s;
 	}
 
-	void Callstack::print_probable_callstack(spdlog::logger& a_log, std::span<const module_pointer> a_modules) const
+	void Callstack::print_probable_callstack(
+		spdlog::logger& a_log,
+		std::span<const module_pointer> a_modules,
+		PDB::SymbolResolver& a_symbols) const
 	{
 		a_log.critical("PROBABLE CALL STACK:"sv);
 
@@ -326,7 +342,7 @@ namespace Crash
 				{
 					try
 					{
-						return mod->frame_info(frame);
+						return mod->frame_info(frame, a_symbols);
 					}
 					catch (...)
 					{
@@ -421,7 +437,10 @@ namespace Crash
 				// Check if this address has game introspection data
 				// FormIDs are always considered relevant as they imply successful introspection
 				const bool is_form_id = full_analysis.starts_with("(FormID");
-				if (!is_form_id && !Introspection::was_introspected(reinterpret_cast<const void*>(address)))
+				const bool is_readonly_object =
+					full_analysis.starts_with("(.?") ||
+					full_analysis.find("*) 0x") != std::string::npos;
+				if (!is_form_id && !is_readonly_object)
 					return;
 
 				// Skip cross-references ("See RSP+XX") - we only want the first full occurrence
@@ -721,7 +740,13 @@ namespace Crash
 			}
 		}
 
-		void print_exception(spdlog::logger& a_log, const ::EXCEPTION_RECORD& a_exception, std::span<const module_pointer> a_modules, const std::string& a_throwLocation = "", const ::CONTEXT* a_context = nullptr)
+		void print_exception(
+			spdlog::logger& a_log,
+			const ::EXCEPTION_RECORD& a_exception,
+			std::span<const module_pointer> a_modules,
+			PDB::SymbolResolver& a_symbols,
+			const std::string& a_throwLocation = "",
+			const ::CONTEXT* a_context = nullptr)
 		{
 #define EXCEPTION_CASE(a_code) \
 	case a_code:               \
@@ -738,16 +763,11 @@ namespace Crash
 				const auto mod = Introspection::get_module_for_pointer(eptr, a_modules);
 				if (mod)
 				{
-					const auto pdbDetails = Crash::PDB::pdb_details(mod->path(), eaddr - mod->address());
-					const auto assembly = mod->assembly((const void*)eaddr);
-					if (!pdbDetails.empty())
-						return fmt::format(
-							" {}+{:07X}\t{} | {})"sv,
-							mod->name(),
-							eaddr - mod->address(),
-							assembly,
-							pdbDetails);
-					return fmt::format(" {}+{:07X}\t{}"sv, mod->name(), eaddr - mod->address(), assembly);
+					const boost::stacktrace::frame frame(eptr);
+					return fmt::format(
+						" ({}{})",
+						mod->name(),
+						mod->frame_info(frame, a_symbols));
 				}
 				else
 					return ""s;
@@ -858,7 +878,9 @@ namespace Crash
 						try
 						{
 							if (cppExInfo->what)
-								a_log.critical("\tInfo: {}"sv, *cppExInfo->what);
+								a_log.critical(
+									"\tInfo (heuristic layout match, not proven std::exception): {}"sv,
+									*cppExInfo->what);
 						}
 						catch (...)
 						{
@@ -933,7 +955,13 @@ namespace Crash
 				++exception_depth;
 				try
 				{
-					print_exception(a_log, *a_exception.ExceptionRecord, a_modules, "", nullptr);
+					print_exception(
+						a_log,
+						*a_exception.ExceptionRecord,
+						a_modules,
+						a_symbols,
+						"",
+						nullptr);
 				}
 				catch (...)
 				{
@@ -946,11 +974,23 @@ namespace Crash
 #undef EXCEPTION_CASE
 		}
 
-		void print_exception_safeguard(spdlog::logger& a_log, const ::EXCEPTION_RECORD& a_exception, std::span<const module_pointer> a_modules, const std::string& a_throwLocation = "", const ::CONTEXT* a_context = nullptr)
+		void print_exception_safeguard(
+			spdlog::logger& a_log,
+			const ::EXCEPTION_RECORD& a_exception,
+			std::span<const module_pointer> a_modules,
+			PDB::SymbolResolver& a_symbols,
+			const std::string& a_throwLocation = "",
+			const ::CONTEXT* a_context = nullptr)
 		{
 			__try
 			{
-				print_exception(a_log, a_exception, a_modules, a_throwLocation, a_context);
+				print_exception(
+					a_log,
+					a_exception,
+					a_modules,
+					a_symbols,
+					a_throwLocation,
+					a_context);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
@@ -1159,35 +1199,9 @@ namespace Crash
 		void print_plugins(spdlog::logger& a_log)
 		{
 			a_log.critical("PLUGINS:"sv);
-
-			const auto datahandler = RE::TESDataHandler::GetSingleton();
-			if (datahandler)
-			{
-				auto modCount = 0;
-				auto lightCount = 0;
-				auto compiledFileCollection = datahandler->compiledFileCollection;
-				if (!compiledFileCollection.files.empty() || !compiledFileCollection.files.empty())
-				{
-					const auto& [files, smallfiles] = compiledFileCollection;
-					const auto fileFormat = [&]()
-					{
-						return "\t[{:>02X}]{:"s + (!smallfiles.empty() ? "5"s : "1"s) + "}{}"s;
-					}();
-
-					modCount = files.size();
-					lightCount = smallfiles.size();
-					a_log.critical("\tLight: {}\tRegular: {}\tTotal: {}"sv, lightCount, modCount, lightCount + modCount);
-					for (const auto& file : files)
-					{
-						a_log.critical(fmt::format(fmt::runtime(fileFormat), file->GetCompileIndex(), "", file->GetFilename()));
-					}
-
-					for (const auto& file : smallfiles)
-					{
-						a_log.critical(fmt::format("\t[FE:{:>03X}] {}", file->GetSmallFileCompileIndex(), file->GetFilename()));
-					}
-				}
-			}
+			a_log.critical(
+				"\t<unavailable: live TESDataHandler traversal is not crash-safe; "
+				"captured module metadata remains available above>");
 		}
 
 		void print_plugins_safeguard(spdlog::logger& a_log)
@@ -1655,7 +1669,11 @@ namespace Crash
 			return it != haystack.end();
 		}
 
-		void print_thread_context(spdlog::logger& a_log, const Callstack* a_callstack, std::span<const module_pointer> a_modules)
+		void print_thread_context(
+			spdlog::logger& a_log,
+			const Callstack* a_callstack,
+			std::span<const module_pointer> a_modules,
+			PDB::SymbolResolver& a_symbols)
 		{
 			a_log.critical("THREAD CONTEXT (HEURISTIC):"sv);
 
@@ -1665,7 +1683,10 @@ namespace Crash
 				return;
 			}
 
-			const auto frames = a_callstack->get_frame_info_strings(a_modules, 50);
+			const auto frames = a_callstack->get_frame_info_strings(
+				a_modules,
+				a_symbols,
+				50);
 			if (frames.empty())
 			{
 				a_log.critical("\tNo frames available"sv);
@@ -1725,11 +1746,19 @@ namespace Crash
 			a_log.critical("\tLikely Role: {}"sv, joined);
 		}
 
-		void print_thread_context_safeguard(spdlog::logger& a_log, const Callstack* a_callstack, std::span<const module_pointer> a_modules)
+		void print_thread_context_safeguard(
+			spdlog::logger& a_log,
+			const Callstack* a_callstack,
+			std::span<const module_pointer> a_modules,
+			PDB::SymbolResolver& a_symbols)
 		{
 			__try
 			{
-				print_thread_context(a_log, a_callstack, a_modules);
+				print_thread_context(
+					a_log,
+					a_callstack,
+					a_modules,
+					a_symbols);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
@@ -1741,14 +1770,38 @@ namespace Crash
 
 		std::int32_t __stdcall UnhandledExceptions(::EXCEPTION_POINTERS* a_exception) noexcept
 		{
+			if (!a_exception || !a_exception->ExceptionRecord || !a_exception->ContextRecord)
+				return EXCEPTION_CONTINUE_SEARCH;
+
 			if (a_exception && a_exception->ExceptionRecord && a_exception->ExceptionRecord->ExceptionCode == static_cast<DWORD>(EXCEPTION_STACK_OVERFLOW))
 				::_resetstkoflw();
 
-			// Install the SEH-to-C++ exception translator
-			_set_se_translator(seh_translator);
+			static std::atomic<DWORD> fatalOwner{};
+			const auto currentThreadId = ::GetCurrentThreadId();
+			DWORD expectedOwner{};
+			if (!fatalOwner.compare_exchange_strong(
+					expectedOwner,
+					currentThreadId,
+					std::memory_order_acq_rel))
+			{
+				// A secondary failure must not wait on or terminate the thread that owns
+				// the only report. Let the OS continue searching for another handler.
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
 
 			std::filesystem::path crashLogPath;
 			std::shared_ptr<spdlog::logger> log;
+			const auto coreEvidence = Capture::capture_core_evidence(
+				*a_exception->ExceptionRecord,
+				*a_exception->ContextRecord);
+			const auto coreWrite = Capture::write_core_evidence(coreEvidence);
+			crashLogPath = coreWrite.path;
+			if (!coreWrite.created)
+				return EXCEPTION_CONTINUE_SEARCH;
+
+			// Everything below is optional enrichment. The raw primary evidence is
+			// already durable at the exact path that will receive the remaining report.
+			_set_se_translator(seh_translator);
 
 			try
 			{
@@ -1765,31 +1818,60 @@ namespace Crash
 
 				const auto modules = Modules::get_loaded_modules();
 				const std::span cmodules{ modules.begin(), modules.end() };
-				auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
-				log = logPtr;
-				crashLogPath = logPath;
-
-				// Clean up old logs
-				clean_old_files(logPath.parent_path(), "crash-"sv, ".log", Settings::iMaxCrashLogs.GetValue(), ".dmp");
-				clean_old_files(logPath.parent_path(), "crash-"sv, ".dmp", Settings::iMaxMiniDumps.GetValue());
-
-				// Write minidump if requested
-				if (Settings::bCrashLogWriteMiniDump.GetValue())
+				log = open_existing_log(crashLogPath, "crash log"sv);
+				std::vector<Introspection::ReadOnly::ModuleRange> readonlyModules;
+				readonlyModules.reserve(modules.size());
+				for (const auto& module : modules)
+					readonlyModules.push_back(Introspection::ReadOnly::ModuleRange{
+						.base = module->address(),
+						.size = module->size(),
+						.name = std::string(module->name()),
+						.path = std::string(module->path())
+					});
+				const auto runtimeVersion =
+					REX::FModule::GetExecutingModule().GetFileVersion();
+				Introspection::ReadOnly::LiveMemoryReader liveReader;
+				Introspection::ReadOnly::AnalysisSession analysisSession(
+					liveReader,
+					readonlyModules,
+					Introspection::ReadOnly::runtime_profile(
+						runtimeVersion[0],
+						runtimeVersion[1],
+						runtimeVersion[2],
+						runtimeVersion[3]));
+				PDB::SymbolResolver symbolResolver;
+				std::vector<std::size_t> capturedStack;
+				std::uint64_t stackLimit{};
+				std::uint64_t stackBase{};
+				if (Capture::current_thread_stack_bounds(
+						stackLimit,
+						stackBase) &&
+					a_exception->ContextRecord->Rsp >= stackLimit &&
+					a_exception->ContextRecord->Rsp < stackBase)
 				{
-					try
-					{
-						auto dumpPath = logPath;
-						dumpPath.replace_extension(".dmp");
-						if (write_minidump(dumpPath, a_exception))
-							log->critical("Minidump written to: {}", dumpPath.string());
-						else
-							log->critical("Failed to write minidump to: {}", dumpPath.string());
-					}
-					catch (...)
-					{
-						log->critical("Exception while writing minidump");
-					}
+					const auto stackBytes =
+						static_cast<std::size_t>(
+							std::min<std::uint64_t>(
+								stackBase -
+									a_exception->ContextRecord->Rsp,
+								64u * 1024u));
+					capturedStack.resize(
+						stackBytes / sizeof(std::size_t));
+					auto stackRead = liveReader.read(
+						Introspection::ReadOnly::TargetAddress(
+							a_exception->ContextRecord->Rsp),
+						std::span<std::byte>{
+							reinterpret_cast<std::byte*>(
+								capturedStack.data()),
+							capturedStack.size() *
+								sizeof(std::size_t) });
+					if (!stackRead)
+						capturedStack.clear();
 				}
+				log->critical("");
+				log->critical("===== OPTIONAL ENRICHMENT =====");
+				if (!coreWrite.completed)
+					log->critical("CORE WARNING: FlushFileBuffers failed with error {}", coreWrite.systemError);
 
 				// Collection to gather relevant objects during analysis
 				RelevantObjectsCollection relevantObjects;
@@ -1799,9 +1881,7 @@ namespace Crash
 					log->critical(""sv);
 					try
 					{
-						// Add timeout protection to prevent hanging on bad operations
 						auto start = std::chrono::steady_clock::now();
-						constexpr auto timeout = std::chrono::seconds(30);
 
 						a_functor();
 
@@ -1837,14 +1917,27 @@ namespace Crash
 				{
 					callstack.emplace(*a_exception->ExceptionRecord, a_exception->ContextRecord);
 					if (IsCppException(*a_exception->ExceptionRecord))
-						throwLocation = callstack->get_throw_location(cmodules);
+						throwLocation = callstack->get_throw_location(
+							cmodules,
+							symbolResolver);
 				}
 				catch (...)
 				{
 					// Callstack construction failed, continue without it
 				}
 
-				print([&]() { print_exception_safeguard(*log, *a_exception->ExceptionRecord, cmodules, throwLocation, a_exception->ContextRecord); }, "print_exception");
+				print(
+					[&]()
+					{
+						print_exception_safeguard(
+							*log,
+							*a_exception->ExceptionRecord,
+							cmodules,
+							symbolResolver,
+							throwLocation,
+							a_exception->ContextRecord);
+					},
+					"print_exception");
 
 				// Reset introspection state once per crash (before all analysis)
 				Introspection::reset_analysis_state();
@@ -1853,20 +1946,24 @@ namespace Crash
 				try
 				{
 					// Collect from registers
-					const auto [regs, regAnalysis] = analyze_registers(*a_exception->ContextRecord, cmodules);
+					const auto [regs, regAnalysis] = analyze_registers(
+						*a_exception->ContextRecord,
+						analysisSession);
 					for (std::size_t i = 0; i < regs.size(); ++i)
 					{
 						relevantObjects.add(regs[i].second, regAnalysis[i], std::string(regs[i].first), 0);
 					}
 
 					// Collect from stack (limited to first 512 entries)
-					const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
-					if (stack_opt)
+					if (!capturedStack.empty())
 					{
-						const auto& stack = *stack_opt;
+						const auto stack =
+							std::span<const std::size_t>(capturedStack);
 						constexpr std::size_t MAX_SCAN = 512;
 						const auto limited_stack = stack.subspan(0, std::min(stack.size(), MAX_SCAN));
-						const auto stack_analyses = analyze_stack_blocks(limited_stack, cmodules);
+						const auto stack_analyses = analyze_stack_blocks(
+							limited_stack,
+							analysisSession);
 
 						std::size_t global_idx = 0;
 						for (std::size_t block_idx = 0; block_idx < stack_analyses.size(); ++block_idx)
@@ -1890,7 +1987,16 @@ namespace Crash
 				print([&]() { print_relevant_objects_section_safeguard(*log, relevantObjects); }, "print_relevant_objects");
 
 				print([&]() { print_process_info_safeguard(*log); }, "print_process_info");
-				print([&]() { print_thread_context_safeguard(*log, callstack ? &(*callstack) : nullptr, cmodules); }, "print_thread_context");
+				print(
+					[&]()
+					{
+						print_thread_context_safeguard(
+							*log,
+							callstack ? &(*callstack) : nullptr,
+							cmodules,
+							symbolResolver);
+					},
+					"print_thread_context");
 				if (Settings::bPrintSettings.GetValue())
 					print([&]() { print_settings_safeguard(*log); }, "print_sysinfo");
 				print([&]() { print_sysinfo_safeguard(*log); }, "print_sysinfo");
@@ -1906,17 +2012,24 @@ namespace Crash
 						if (!callstack_ptr)
 							callstack_ptr = &fallback;
 
-						const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
-						if (!stack_opt)
+						if (capturedStack.empty())
 						{
 							log->critical("CALL STACK (HYBRID):");
 							log->critical("\tFAILED TO READ TIB");
-							callstack_ptr->print(*log, cmodules);
+							callstack_ptr->print(
+								*log,
+								cmodules,
+								symbolResolver);
 							return;
 						}
 
 						const auto probable_frames = callstack_ptr->get_frame_addresses();
-						print_hybrid_callstack_safeguard(*log, probable_frames, *stack_opt, cmodules);
+						print_hybrid_callstack_safeguard(
+							*log,
+							probable_frames,
+							capturedStack,
+							cmodules,
+							symbolResolver);
 					}
 					catch (const std::bad_alloc&)
 					{
@@ -1938,6 +2051,37 @@ namespace Crash
 					}
 				}, "hybrid_callstack");
 
+				// Essential exception and saved-context call-stack evidence are now
+				// present. Retention and dumps are intentionally deferred until here.
+				clean_old_files(
+					crashLogPath.parent_path(),
+					"crash-"sv,
+					".log",
+					Settings::iMaxCrashLogs.GetValue(),
+					".dmp");
+				clean_old_files(
+					crashLogPath.parent_path(),
+					"crash-"sv,
+					".dmp",
+					Settings::iMaxMiniDumps.GetValue());
+
+				if (Settings::bCrashLogWriteMiniDump.GetValue())
+				{
+					try
+					{
+						auto dumpPath = crashLogPath;
+						dumpPath.replace_extension(".dmp");
+						if (write_minidump(dumpPath, a_exception))
+							log->critical("Minidump written to: {}", dumpPath.string());
+						else
+							log->critical("Failed to write minidump to: {}", dumpPath.string());
+					}
+					catch (...)
+					{
+						log->critical("Exception while writing minidump");
+					}
+				}
+
 				// Analyze registers and stack first, then backfill, then print
 				try
 				{
@@ -1950,15 +2094,17 @@ namespace Crash
 					std::vector<AnalysisBlock> allBlocks;
 
 					// Analyze registers
-					const auto [regs, regAnalysis] = analyze_registers(*a_exception->ContextRecord, cmodules);
+					const auto [regs, regAnalysis] = analyze_registers(
+						*a_exception->ContextRecord,
+						analysisSession);
 					const auto [dummy_regs, regValues] = get_register_info(*a_exception->ContextRecord);
 					allBlocks.push_back({ regAnalysis, regValues });
 
 					// Analyze stack blocks
-					const auto stack_opt = get_stack_info(*a_exception->ContextRecord);
-					if (stack_opt)
+					if (!capturedStack.empty())
 					{
-						const auto& stack = *stack_opt;
+						const auto stack =
+							std::span<const std::size_t>(capturedStack);
 						constexpr std::size_t MAX_SCAN = 512;
 						const auto scanSize = std::min(stack.size(), MAX_SCAN);
 
@@ -1966,7 +2112,14 @@ namespace Crash
 						for (std::size_t off = 0; off < scanSize; off += blockSize)
 						{
 							auto block = stack.subspan(off, std::min<std::size_t>(scanSize - off, blockSize));
-							auto analysis = Introspection::analyze_data(block, cmodules, [&](size_t i) { return fmt::format("RSP+{:X}", (off + i) * sizeof(std::size_t)); });
+							auto analysis = Introspection::analyze_data(
+								block,
+								analysisSession,
+								[&](size_t i) {
+									return fmt::format(
+										"RSP+{:X}",
+										(off + i) * sizeof(std::size_t));
+								});
 							allBlocks.push_back({ std::move(analysis), block });
 						}
 					}
@@ -1987,13 +2140,35 @@ namespace Crash
 
 					// Print with pre-analyzed data
 					print([&]() { print_registers_safeguard(*log, *a_exception->ContextRecord, cmodules, finalRegAnalysis); }, "print_registers");
-					print([&]() { print_stack_safeguard(*log, *a_exception->ContextRecord, cmodules, stackAnalyses); }, "print_raw_stack");
+					print([&]() {
+						log->critical("STACK:");
+						std::size_t index{};
+						for (const auto& block : stackAnalyses)
+						{
+							for (const auto& decoded : block)
+							{
+								if (index >= capturedStack.size())
+									break;
+								log->critical(
+									"\t[RSP+{:04X}] 0x{:016X} {}",
+									index * sizeof(std::size_t),
+									capturedStack[index],
+									decoded);
+								++index;
+							}
+						}
+						if (capturedStack.empty())
+							log->critical("\t<unavailable: bounded read of saved stack failed>");
+					}, "print_raw_stack");
 				}
 				catch (...)
 				{
-					// Fallback to original behavior if analysis fails
+					// Preserve registers without attempting a second unsafe object pass.
 					print([&]() { print_registers_safeguard(*log, *a_exception->ContextRecord, cmodules); }, "print_registers");
-					print([&]() { print_stack_safeguard(*log, *a_exception->ContextRecord, cmodules); }, "print_raw_stack");
+					print([&]() {
+						log->critical("STACK:");
+						log->critical("\t<unavailable: bounded read-only analysis failed>");
+					}, "print_raw_stack");
 				}
 				print([&]() { print_modules_safeguard(*log, cmodules); }, "print_modules");
 				print([&]() { print_xse_plugins_safeguard(*log, cmodules); }, "print_xse_plugins");
@@ -2008,23 +2183,24 @@ namespace Crash
 				// Wrap in try-catch to prevent std::terminate from noexcept function
 				try
 				{
-					if (!log)
+					if (log)
 					{
-						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
-						log = logPtr;
-						crashLogPath = logPath;
+						log->critical("");
+						log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+						log->critical("SEH Exception occurred during crash log generation: {} (Code: 0x{:X})", se.what(), se.code());
+						log->critical("The crash log above may be incomplete.");
+						log->flush();
 					}
-					log->critical("");
-					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
-					log->critical("SEH Exception occurred during crash log generation: {} (Code: 0x{:X})", se.what(), se.code());
-					log->critical("The crash log above may be incomplete.");
-					log->flush();
+					else
+						(void)Capture::append_core_marker(
+							crashLogPath,
+							"\r\n===== CRASH LOGGER INTERNAL ERROR =====\r\nSEH during enrichment; core evidence remains complete.\r\n");
 				}
 				catch (...)
 				{
-					// Last resort: can't create logger or log failed, just terminate
-					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
-					return EXCEPTION_CONTINUE_SEARCH;
+					(void)Capture::append_core_marker(
+						crashLogPath,
+						"\r\nENRICHMENT APPEND FAILED; core evidence remains complete.\r\n");
 				}
 			}
 			catch (const std::exception& e)
@@ -2033,23 +2209,24 @@ namespace Crash
 				// Wrap in try-catch to prevent std::terminate from noexcept function
 				try
 				{
-					if (!log)
+					if (log)
 					{
-						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
-						log = logPtr;
-						crashLogPath = logPath;
+						log->critical("");
+						log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+						log->critical("C++ exception occurred during crash log generation: {}", e.what());
+						log->critical("The crash log above may be incomplete.");
+						log->flush();
 					}
-					log->critical("");
-					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
-					log->critical("C++ exception occurred during crash log generation: {}", e.what());
-					log->critical("The crash log above may be incomplete.");
-					log->flush();
+					else
+						(void)Capture::append_core_marker(
+							crashLogPath,
+							"\r\n===== CRASH LOGGER INTERNAL ERROR =====\r\nC++ exception during enrichment; core evidence remains complete.\r\n");
 				}
 				catch (...)
 				{
-					// Last resort: can't create logger or log failed, just terminate
-					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
-					return EXCEPTION_CONTINUE_SEARCH;
+					(void)Capture::append_core_marker(
+						crashLogPath,
+						"\r\nENRICHMENT APPEND FAILED; core evidence remains complete.\r\n");
 				}
 			}
 			catch (...)
@@ -2057,23 +2234,24 @@ namespace Crash
 				// Catch any other unknown exception to the existing log (or create new if needed)
 				// Wrap in try-catch to prevent std::terminate from noexcept function
 				try {
-					if (!log)
+					if (log)
 					{
-						auto [logPtr, logPath] = get_timestamped_log("crash-"sv, "crash log"s);
-						log = logPtr;
-						crashLogPath = logPath;
+						log->critical("");
+						log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
+						log->critical("Unknown exception occurred during crash log generation");
+						log->critical("The crash log above may be incomplete.");
+						log->flush();
 					}
-					log->critical("");
-					log->critical("===== CRASH LOGGER INTERNAL ERROR =====");
-					log->critical("Unknown exception occurred during crash log generation");
-					log->critical("The crash log above may be incomplete.");
-					log->flush();
+					else
+						(void)Capture::append_core_marker(
+							crashLogPath,
+							"\r\n===== CRASH LOGGER INTERNAL ERROR =====\r\nUnknown exception during enrichment; core evidence remains complete.\r\n");
 				}
 				catch (...)
 				{
-					// Last resort: can't create logger or log failed, just terminate
-					TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
-					return EXCEPTION_CONTINUE_SEARCH;
+					(void)Capture::append_core_marker(
+						crashLogPath,
+						"\r\nENRICHMENT APPEND FAILED; core evidence remains complete.\r\n");
 				}
 			}
 
@@ -2149,6 +2327,17 @@ namespace Crash
 		}
 
 		REX::INFO("Crash Log Directory: {}"sv, crashPath.string());
+		{
+			std::error_code directoryError;
+			std::filesystem::create_directories(crashPath, directoryError);
+			if (directoryError ||
+				!Capture::prepare_fatal_report_directory(crashPath))
+			{
+				REX::FAIL(
+					"Failed to prepare the crash evidence directory (error {})"sv,
+					directoryError.value());
+			}
+		}
 
 		{
 			ULONG stackGuarantee = 64 * 1024;

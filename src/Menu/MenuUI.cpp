@@ -729,7 +729,8 @@ namespace CrashUI
 			capture.settings.push_back(MakeSetting(
 				"Debugging.bThreadDumpWriteMiniDump",
 				"Thread-dump minidump",
-				"Writes a minidump alongside manually triggered thread dumps.",
+				"Writes a minidump from the same Process Snapshot used by the "
+				"manual thread report, before analysis.",
 				SettingKey::kThreadDumpWriteMiniDump,
 				&Settings::Values::threadDumpWriteMiniDump,
 				Settings::kBuiltInDefaults.threadDumpWriteMiniDump,
@@ -778,24 +779,26 @@ namespace CrashUI
 				Text{ 1024, false }));
 			advanced.settings.push_back(MakeSetting(
 				"Debugging.bHeapAnalysis",
-				"Heap analysis",
-				"Enables bounded heap-allocation analysis in future reports.",
+				"Heap analysis (retired)",
+				"Deprecated compatibility key. Heap ownership probing is unsafe "
+				"during failures; reports use read-only memory-region "
+				"classification instead.",
 				SettingKey::kHeapAnalysis,
 				&Settings::Values::heapAnalysis,
 				Settings::kBuiltInDefaults.heapAnalysis,
 				Checkbox{}));
 			advanced.settings.push_back(MakeSetting(
 				"Debugging.iMaxHeapsToCheck",
-				"Maximum heaps to check",
-				"Must be at least one.",
+				"Maximum heaps (retired)",
+				"Deprecated compatibility key retained without effect.",
 				SettingKey::kMaxHeapsToCheck,
 				&Settings::Values::maxHeapsToCheck,
 				Settings::kBuiltInDefaults.maxHeapsToCheck,
 				signedRange(1, (std::numeric_limits<int32_t>::max)())));
 			advanced.settings.push_back(MakeSetting(
 				"Debugging.iMaxHeapIterationsPerHeap",
-				"Maximum allocations per heap",
-				"Must be at least one.",
+				"Maximum allocations (retired)",
+				"Deprecated compatibility key retained without effect.",
 				SettingKey::kMaxHeapIterationsPerHeap,
 				&Settings::Values::maxHeapIterationsPerHeap,
 				Settings::kBuiltInDefaults.maxHeapIterationsPerHeap,
