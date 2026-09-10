@@ -349,13 +349,19 @@ namespace CrashUI
 						selected,
 						dmui::ui::SelectableFlags::kSpanAllColumns))
 				{
-					s_selectedReport = report.path;
+					++s_selectionGeneration;
 					s_previewPage = 0;
 					s_previewSearch.clear();
-					ReportRepository::GetSingleton().RequestRead(
-						report,
-						a_index->generation,
-						++s_selectionGeneration);
+					if (selected)
+						s_selectedReport.clear();
+					else
+					{
+						s_selectedReport = report.path;
+						ReportRepository::GetSingleton().RequestRead(
+							report,
+							a_index->generation,
+							s_selectionGeneration);
+					}
 				}
 				(void)dmui::ui::TableSetColumnIndex(1);
 				dmui::ui::TextUnformatted(
