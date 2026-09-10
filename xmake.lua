@@ -1,5 +1,6 @@
 -- include subprojects
 includes("lib/commonlibf4")
+includes("lib/dearmoddingui-api")
 
 -- name and version
 local plugin_name = "AddictolCrashLogger"
@@ -59,6 +60,7 @@ target(plugin_name)
     add_packages("rapidcsv")
     add_packages("rsm-binary-io")
     add_packages("zydis")
+    add_deps("dearmoddingui-api")
 
     -- add DIA SDK Includes
     add_includedirs(os.getenv("VSINSTALLDIR") .. "/DIA SDK/include")

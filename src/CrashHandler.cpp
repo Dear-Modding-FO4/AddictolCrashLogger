@@ -376,6 +376,27 @@ namespace Crash
 		return {};
 	}
 
+	std::filesystem::path GetStartupLogPath()
+	{
+		auto logger = spdlog::default_logger();
+		if (!logger)
+			return {};
+
+		for (const auto& sink : logger->sinks())
+		{
+			if (auto fileSink =
+					std::dynamic_pointer_cast<spdlog::sinks::basic_file_sink_mt>(sink))
+				return std::filesystem::path(fileSink->filename());
+		}
+
+		return {};
+	}
+
+	std::filesystem::path GetCrashLogDirectory()
+	{
+		return crashPath;
+	}
+
 	namespace
 	{
 		// Structure to hold information about a relevant game object found during crash analysis

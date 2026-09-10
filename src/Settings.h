@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Settings/SettingsValues.h"
+
 #include <REX/REX/TOML.h>
 #include "REX/W32/USER32.h"
 
@@ -8,30 +10,32 @@ using namespace std::literals;
 namespace Settings
 {
 	// General
-	static REX::TOML::Bool	bEnableCrashLogger			{ "General"sv,					"bEnableCrashLogger"sv,			true							};
-	static REX::TOML::Bool	bPrintSettings				{ "General"sv,					"bPrintSettings"sv,				true							};
-	static REX::TOML::Bool	bAutoOpenLogs				{ "General"sv,					"bAutoOpenLogs"sv,				false							};
-	static REX::TOML::I32	iMaxCrashLogs				{ "General"sv,					"iMaxCrashLogs"sv,				20								};
-	static REX::TOML::I32	iMaxMiniDumps				{ "General"sv,					"iMaxMiniDumps"sv,				1								};
+	extern REX::TOML::Bool<>	bEnableCrashLogger;
+	extern REX::TOML::Bool<>	bPrintSettings;
+	extern REX::TOML::Bool<>	bAutoOpenLogs;
+	extern REX::TOML::I32<>	iMaxCrashLogs;
+	extern REX::TOML::I32<>	iMaxMiniDumps;
 
 	// Directories
-	static REX::TOML::Str	sCrashLogDirectory			{ "Directories"sv,				"sCrashLogDirectory"sv,			std::string{""}					};
-	static REX::TOML::Str	sSymcacheDirectory			{ "Directories"sv,				"sSymcacheDirectory"sv,			std::string{"C:\\symcache"}		};
+	extern REX::TOML::Str<>	sCrashLogDirectory;
+	extern REX::TOML::Str<>	sSymcacheDirectory;
 
 	// Pastebin
-	static REX::TOML::Bool	bAutoUploadCrashLog			{ "Pastebin"sv,					"bAutoUploadCrashLog"sv,		false							};
-	static REX::TOML::Str	sPastebinAPIKey				{ "Pastebin"sv,					"sPastebinAPIKey"sv,			std::string{""}					};
+	extern REX::TOML::Bool<>	bAutoUploadCrashLog;
+	extern REX::TOML::Str<>	sPastebinAPIKey;
 
 	// Debugging
-	static REX::TOML::Bool	bWaitForDebugger			{ "Debugging"sv,				"bWaitForDebugger"sv,			false							};
-	static REX::TOML::Bool	bFullMemoryMiniDump			{ "Debugging"sv,				"bFullMemoryMiniDump"sv,		false							};
-	static REX::TOML::Bool	bCrashLogWriteMiniDump		{ "Debugging"sv,				"bCrashLogWriteMiniDump"sv,		false							};
-	static REX::TOML::Bool	bThreadDumpWriteMiniDump	{ "Debugging"sv,				"bThreadDumpWriteMiniDump"sv,	false							};
-	static REX::TOML::Bool	bHeapAnalysis				{ "Debugging"sv,				"bHeapAnalysis"sv,				false							};
-	static REX::TOML::I32	iMaxHeapsToCheck			{ "Debugging"sv,				"iMaxHeapsToCheck"sv,			1								};
-	static REX::TOML::I32	iMaxHeapIterationsPerHeap	{ "Debugging"sv,				"iMaxHeapIterationsPerHeap"sv,	1000							};
+	extern REX::TOML::Bool<>	bWaitForDebugger;
+	extern REX::TOML::Bool<>	bFullMemoryMiniDump;
+	extern REX::TOML::Bool<>	bCrashLogWriteMiniDump;
+	extern REX::TOML::Bool<>	bThreadDumpWriteMiniDump;
+	extern REX::TOML::Bool<>	bHeapAnalysis;
+	extern REX::TOML::I32<>	iMaxHeapsToCheck;
+	extern REX::TOML::I32<>	iMaxHeapIterationsPerHeap;
 
 	// Hotkeys
-	static REX::TOML::Bool	bEnableThreadDumpHotkey		{ "Hotkeys"sv,					"bEnableThreadDumpHotkey"sv,	false							};
-	static std::vector<int>	hotkeyThreadDump			{ REX::W32::VK::VK_CONTROL,		REX::W32::VK::VK_SHIFT,			REX::W32::VK::VK_F12			};
+	extern REX::TOML::Bool<>	bEnableThreadDumpHotkey;
+	extern const std::vector<int> hotkeyThreadDump;
+
+	[[nodiscard]] Values Snapshot();
 }

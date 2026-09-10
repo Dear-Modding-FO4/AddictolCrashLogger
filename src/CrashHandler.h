@@ -46,5 +46,9 @@ namespace Crash
 		std::span<const boost::stacktrace::frame> _frames;
 	};
 
+	[[nodiscard]] std::filesystem::path GetF4SELogDirectory();
+	[[nodiscard]] std::filesystem::path GetStartupLogPath();
+	[[nodiscard]] std::filesystem::path GetCrashLogDirectory();
+
 	bool Install();
 }
