@@ -310,12 +310,14 @@ namespace Crash
 					frame_text(a_operation, frame, a_symbols));
 			}
 
-			if (a_thread.hasStackBounds)
+			if (a_thread.hasStackBounds &&
+				a_thread.context.Rsp >= a_thread.stackLimit &&
+				a_thread.context.Rsp < a_thread.stackBase)
 			{
 				const auto available = static_cast<std::size_t>(
 					std::min<std::uint64_t>(
 						a_thread.stackBase - a_thread.context.Rsp,
-						64u * 1024u));
+						512u * sizeof(std::size_t)));
 				std::vector<std::size_t> stack(available / sizeof(std::size_t));
 				auto stackRead = a_operation.read(
 					a_thread.context.Rsp,
@@ -324,31 +326,31 @@ namespace Crash
 						stack.size() * sizeof(std::size_t) });
 				if (stackRead)
 				{
-					const auto decoded = Introspection::analyze_data(
-						stack,
-						a_analysis,
-						[](std::size_t a_index) {
-							return fmt::format(
-								"RSP+{:X}",
-								a_index * sizeof(std::size_t));
-						});
 					a_log.critical(
 						"\tSTACK OBJECT CANDIDATES (bounded {} bytes, provenance={}):",
 						stackRead->bytesRead,
 						static_cast<int>(stackRead->provenance));
 					std::size_t emitted{};
 					for (std::size_t index = 0;
-						index < decoded.size() && emitted < 64;
+						index < stack.size() && emitted < 64;
 						++index)
 					{
-						if (decoded[index].empty() ||
-							decoded[index].starts_with("(void*)"))
+						const auto& budget = a_analysis.diagnostics();
+						if (budget.readBudgetExceeded ||
+							budget.byteBudgetExceeded ||
+							budget.objectBudgetExceeded)
+							break;
+						const auto decoded = a_analysis.analyze_one(
+							Introspection::ReadOnly::TargetAddress(stack[index]),
+							fmt::format("RSP+{:X}", index * sizeof(std::size_t)));
+						if (decoded.empty() || decoded.starts_with("(void*)") ||
+							decoded.starts_with("<unavailable:"))
 							continue;
 						a_log.critical(
 							"\t\tRSP+{:04X} 0x{:016X} {}",
 							index * sizeof(std::size_t),
 							stack[index],
-							decoded[index]);
+							decoded);
 						++emitted;
 					}
 					if (emitted == 64)
@@ -360,6 +362,15 @@ namespace Crash
 						stackRead.error().message,
 						stackRead.error().systemError);
 			}
+			else
+				a_log.critical("\tSTACK: <unavailable: captured RSP is outside valid stack bounds>");
+			const auto& diagnostics = a_analysis.diagnostics();
+			a_log.critical(
+				"\tTHREAD ANALYSIS STATUS: {} reads={} bytes={} objects={} weakReads={} unavailableFields={}",
+				diagnostics.readBudgetExceeded || diagnostics.byteBudgetExceeded ||
+					diagnostics.objectBudgetExceeded ? "PARTIAL (thread budget reached)" : "within budget",
+				diagnostics.reads, diagnostics.bytes, diagnostics.objects,
+				diagnostics.weakReads, diagnostics.unavailableFields);
 			a_log.critical("");
 		}
 	}
@@ -462,21 +473,12 @@ namespace Crash
 			Introspection::ReadOnly::SnapshotMemoryReader reader(operation);
 			const auto version =
 				REX::FModule::GetExecutingModule().GetFileVersion();
-			Introspection::ReadOnly::AnalysisSession analysis(
-				reader,
-				moduleRanges,
-				Introspection::ReadOnly::runtime_profile(
-					version[0],
-					version[1],
-					version[2],
-					version[3]),
-				Introspection::ReadOnly::AnalysisBudgets{
-					.maximumReads = 24'000,
-					.maximumBytes = 4u * 1024u * 1024u,
-					.maximumObjects = 2'000,
-					.maximumDepth = 8,
-					.maximumStringBytes = 512
-				});
+			const auto profile = Introspection::ReadOnly::runtime_profile(
+				version[0], version[1], version[2], version[3]);
+			constexpr std::size_t maximumReads = 24'000;
+			constexpr std::size_t maximumBytes = 4u * 1024u * 1024u;
+			constexpr std::size_t maximumObjects = 2'000;
+			Introspection::ReadOnly::AnalysisDiagnostics diagnostics;
 			PDB::SymbolResolver symbolResolver;
 
 			std::vector<const Capture::CapturedThread*> ordered;
@@ -522,6 +524,17 @@ namespace Crash
 			}
 			log->critical("");
 			for (std::size_t index = 0; index < ordered.size(); ++index)
+			{
+				const auto remainingThreads = ordered.size() - index;
+				Introspection::ReadOnly::AnalysisSession analysis(
+					reader, moduleRanges, profile,
+					Introspection::ReadOnly::AnalysisBudgets{
+						.maximumReads = (maximumReads - std::min(maximumReads, diagnostics.reads)) / remainingThreads,
+						.maximumBytes = (maximumBytes - std::min(maximumBytes, diagnostics.bytes)) / remainingThreads,
+						.maximumObjects = (maximumObjects - std::min(maximumObjects, diagnostics.objects)) / remainingThreads,
+						.maximumDepth = 8,
+						.maximumStringBytes = 512
+					});
 				write_thread(
 					*log,
 					*ordered[index],
@@ -530,8 +543,17 @@ namespace Crash
 					operation,
 					analysis,
 					symbolResolver);
-
-			const auto& diagnostics = analysis.diagnostics();
+				const auto& threadDiagnostics = analysis.diagnostics();
+				diagnostics.reads += threadDiagnostics.reads;
+				diagnostics.bytes += threadDiagnostics.bytes;
+				diagnostics.objects += threadDiagnostics.objects;
+				diagnostics.weakReads += threadDiagnostics.weakReads;
+				diagnostics.unavailableFields += threadDiagnostics.unavailableFields;
+				diagnostics.readBudgetExceeded |= threadDiagnostics.readBudgetExceeded;
+				diagnostics.byteBudgetExceeded |= threadDiagnostics.byteBudgetExceeded;
+				diagnostics.objectBudgetExceeded |= threadDiagnostics.objectBudgetExceeded;
+				log->flush();
+			}
 			log->critical(
 				"READ-ONLY ANALYSIS STATUS: reads={} bytes={} objects={} weakReads={} unavailableFields={}",
 				diagnostics.reads,
@@ -542,7 +564,7 @@ namespace Crash
 			if (diagnostics.readBudgetExceeded ||
 				diagnostics.byteBudgetExceeded ||
 				diagnostics.objectBudgetExceeded)
-				log->critical("READ-ONLY ANALYSIS STATUS: PARTIAL (budget reached)");
+				log->critical("READ-ONLY ANALYSIS STATUS: PARTIAL (one or more thread budgets reached)");
 			log->flush();
 
 			clean_old_files(

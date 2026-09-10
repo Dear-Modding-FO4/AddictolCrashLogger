@@ -47,17 +47,6 @@ namespace Crash::Introspection::ReadOnly
 			}
 		}
 
-		[[nodiscard]] bool looks_like_form(std::string_view a_name) noexcept
-		{
-			return a_name.find("TESForm") != std::string_view::npos ||
-			       a_name.find("TESObject") != std::string_view::npos ||
-			       a_name.find("Character") != std::string_view::npos ||
-			       a_name.find("PlayerCharacter") != std::string_view::npos ||
-			       a_name.find("TESQuest") != std::string_view::npos ||
-			       a_name.find("TESNPC") != std::string_view::npos ||
-			       a_name.find("TESFaction") != std::string_view::npos;
-		}
-
 		[[nodiscard]] std::string display_type_name(
 			std::string_view a_decorated)
 		{
@@ -87,6 +76,34 @@ namespace Crash::Introspection::ReadOnly
 			std::uint32_t selfRva{};
 		};
 
+		struct ClassHierarchyDescriptor
+		{
+			std::uint32_t signature{};
+			std::uint32_t attributes{};
+			std::uint32_t baseClassCount{};
+			std::uint32_t baseClassArrayRva{};
+		};
+
+		struct Pmd
+		{
+			std::int32_t memberDisplacement{};
+			std::int32_t vbtableDisplacement{};
+			std::int32_t displacementInVbtable{};
+		};
+
+		struct BaseClassDescriptor
+		{
+			std::uint32_t typeDescriptorRva{};
+			std::uint32_t containedBaseCount{};
+			Pmd pmd{};
+			std::uint32_t attributes{};
+		};
+
+		static_assert(sizeof(CompleteObjectLocator) == 0x18);
+		static_assert(sizeof(ClassHierarchyDescriptor) == 0x10);
+		static_assert(sizeof(Pmd) == 0xC);
+		static_assert(sizeof(BaseClassDescriptor) == 0x18);
+
 		struct StringPoolEntry
 		{
 			std::uint64_t left{};
@@ -98,6 +115,56 @@ namespace Crash::Introspection::ReadOnly
 
 		constexpr std::uint16_t kStringShallow = 1u << 14;
 		constexpr std::uint16_t kStringWide = 1u << 15;
+		constexpr std::size_t kMaximumRttiBaseClasses = 256;
+		constexpr std::uint64_t kMaximumBaseDisplacement = 0x100000;
+
+		constexpr std::string_view kTesForm = ".?AVTESForm@@";
+		constexpr std::string_view kNiObjectNet = ".?AVNiObjectNET@@";
+		constexpr std::string_view kNiAvObject = ".?AVNiAVObject@@";
+		constexpr std::string_view kTesObjectRefr = ".?AVTESObjectREFR@@";
+		constexpr std::string_view kTesQuest = ".?AVTESQuest@@";
+		constexpr std::string_view kCodeTasklet =
+			".?AVCodeTasklet@Internal@BSScript@@";
+		constexpr std::string_view kNiStream = ".?AVNiStream@@";
+		constexpr std::string_view kNativeFunctionBase =
+			".?AVNativeFunctionBase@NF_util@BSScript@@";
+		constexpr std::string_view kObjectTypeInfo =
+			".?AVObjectTypeInfo@BSScript@@";
+		constexpr std::string_view kBsShaderProperty =
+			".?AVBSShaderProperty@@";
+		constexpr std::string_view kTesFullName = ".?AVTESFullName@@";
+
+		[[nodiscard]] std::expected<TargetAddress, Capture::Error> module_rva(
+			const ModuleRange& a_module,
+			std::uint32_t a_rva,
+			std::size_t a_size,
+			std::string_view a_description)
+		{
+			if (a_rva >= a_module.size ||
+				a_size > a_module.size - a_rva ||
+				a_rva > std::numeric_limits<std::uint64_t>::max() - a_module.base ||
+				a_size > std::numeric_limits<std::uint64_t>::max() -
+					(a_module.base + a_rva))
+				return std::unexpected(error(
+					Capture::ErrorCode::kInvalidMetadata,
+					ERROR_INVALID_DATA,
+					fmt::format(
+						"{} is outside its captured module",
+						a_description)));
+			return TargetAddress(a_module.base + a_rva);
+		}
+
+		[[nodiscard]] bool module_contains(
+			const ModuleRange& a_module,
+			TargetAddress a_address,
+			std::size_t a_size) noexcept
+		{
+			if (a_address.value() < a_module.base)
+				return false;
+			const auto offset = a_address.value() - a_module.base;
+			return offset < a_module.size &&
+			       a_size <= a_module.size - offset;
+		}
 	}
 
 	std::expected<TargetAddress, Capture::Error> TargetAddress::add(
@@ -144,7 +211,24 @@ namespace Crash::Introspection::ReadOnly
 					completed));
 			const auto regionBase =
 				reinterpret_cast<std::uint64_t>(information.BaseAddress);
+			if (information.RegionSize >
+				std::numeric_limits<std::uint64_t>::max() - regionBase)
+				return std::unexpected(error(
+					completed == 0 ?
+						Capture::ErrorCode::kAddressOverflow :
+						Capture::ErrorCode::kPartialRead,
+					ERROR_ARITHMETIC_OVERFLOW,
+					"live memory region range overflow",
+					completed));
 			const auto regionEnd = regionBase + information.RegionSize;
+			if (current < regionBase || current >= regionEnd)
+				return std::unexpected(error(
+					completed == 0 ?
+						Capture::ErrorCode::kUnreadable :
+						Capture::ErrorCode::kPartialRead,
+					ERROR_NOACCESS,
+					"live memory query did not cover the requested address",
+					completed));
 			const auto chunk = static_cast<std::size_t>(
 				std::min<std::uint64_t>(
 					a_destination.size() - completed,
@@ -157,13 +241,16 @@ namespace Crash::Introspection::ReadOnly
 					chunk,
 					std::addressof(bytesRead)) ||
 				bytesRead != chunk)
+			{
+				const auto total = completed + static_cast<std::size_t>(bytesRead);
 				return std::unexpected(error(
-					completed == 0 ?
+					total == 0 ?
 						Capture::ErrorCode::kUnreadable :
 						Capture::ErrorCode::kPartialRead,
 					::GetLastError(),
 					"live best-effort ReadProcessMemory failed",
-					completed + bytesRead));
+					total));
+			}
 			completed += chunk;
 		}
 		return Capture::ReadResult{
@@ -214,12 +301,38 @@ namespace Crash::Introspection::ReadOnly
 		}
 		++m_diagnostics.reads;
 		auto result = m_reader.read(a_address, a_destination);
+		const auto completed = result ?
+			result->bytesRead :
+			result.error().bytesCompleted;
+		m_diagnostics.bytes += std::min(completed, a_destination.size());
 		if (result)
 		{
-			m_diagnostics.bytes += result->bytesRead;
+			if (result->bytesRead > a_destination.size())
+				return std::unexpected(error(
+					Capture::ErrorCode::kInvalidMetadata,
+					ERROR_INVALID_DATA,
+					"memory reader reported more bytes than requested",
+					a_destination.size()));
+			if (result->bytesRead < a_destination.size())
+				return std::unexpected(error(
+					Capture::ErrorCode::kPartialRead,
+					ERROR_PARTIAL_COPY,
+					"memory reader returned successful partial coverage",
+					result->bytesRead));
 			if (result->provenance == Capture::MemoryProvenance::kSharedImageWeak ||
 				result->provenance == Capture::MemoryProvenance::kSharedMappedWeak ||
 				result->provenance == Capture::MemoryProvenance::kUnknownWeak)
+				++m_diagnostics.weakReads;
+		}
+		else
+		{
+			if (result.error().bytesCompleted > a_destination.size())
+				return std::unexpected(error(
+					Capture::ErrorCode::kInvalidMetadata,
+					ERROR_INVALID_DATA,
+					"memory reader reported more completed bytes than requested",
+					a_destination.size()));
+			if (completed != 0)
 				++m_diagnostics.weakReads;
 		}
 		return result;
@@ -234,27 +347,73 @@ namespace Crash::Introspection::ReadOnly
 			m_budgets.maximumStringBytes);
 		std::string value;
 		value.reserve(maximum);
-		for (std::size_t index = 0; index < maximum; ++index)
+		if (maximum == 0)
+			return std::unexpected(error(
+				Capture::ErrorCode::kBudgetExceeded, ERROR_INSUFFICIENT_BUFFER,
+				"target string has no available read budget"));
+
+		static const std::size_t pageSize = [] {
+			SYSTEM_INFO information{};
+			::GetSystemInfo(std::addressof(information));
+			return information.dwPageSize == 0 ?
+				std::size_t{ 4096 } :
+				static_cast<std::size_t>(information.dwPageSize);
+		}();
+		std::array<char, 64> buffer{};
+		std::size_t completed{};
+		while (completed < maximum)
 		{
-			char character{};
+			auto current = a_address.add(completed);
+			if (!current)
+				return std::unexpected(current.error());
+			const auto pageOffset =
+				static_cast<std::size_t>(current->value() % pageSize);
+			const auto remainingByteBudget = m_budgets.maximumBytes -
+				std::min(m_diagnostics.bytes, m_budgets.maximumBytes);
+			if (remainingByteBudget == 0)
+			{
+				m_diagnostics.byteBudgetExceeded = true;
+				return std::unexpected(error(
+					Capture::ErrorCode::kBudgetExceeded, ERROR_INSUFFICIENT_BUFFER,
+					"target string exhausted the analysis byte budget", completed));
+			}
+			const auto chunk = std::min({
+				buffer.size(),
+				maximum - completed,
+				pageSize - pageOffset,
+				remainingByteBudget
+			});
 			auto read = read_bytes(
-				TargetAddress(a_address.value() + index),
+				*current,
 				std::span<std::byte>{
-					reinterpret_cast<std::byte*>(std::addressof(character)),
-					sizeof(character) });
+					reinterpret_cast<std::byte*>(buffer.data()),
+					chunk });
+			if (!read && read.error().code != Capture::ErrorCode::kPartialRead)
+				return std::unexpected(read.error());
+			const auto available = read ?
+				chunk :
+				std::min(read.error().bytesCompleted, chunk);
+			for (std::size_t index = 0; index < available; ++index)
+			{
+				const auto character = buffer[index];
+				if (character == '\0')
+					return value;
+				const auto byte = static_cast<unsigned char>(character);
+				if ((byte < 0x20 && character != '\t' && character != '\n' && character != '\r') || byte > 0x7E)
+					return std::unexpected(error(
+						Capture::ErrorCode::kInvalidMetadata,
+						ERROR_INVALID_DATA,
+						"target string contains non-printable bytes",
+						completed + index));
+				value.push_back(character);
+			}
 			if (!read)
 				return std::unexpected(read.error());
-			if (character == '\0')
-				return value;
-			const auto byte = static_cast<unsigned char>(character);
-			if ((byte < 0x20 && character != '\t') || byte > 0x7E)
-				return std::unexpected(error(
-					Capture::ErrorCode::kInvalidMetadata,
-					ERROR_INVALID_DATA,
-					"target string contains non-printable bytes"));
-			value.push_back(character);
+			completed += chunk;
 		}
-		return value;
+		return std::unexpected(error(
+			Capture::ErrorCode::kUnavailable, ERROR_INSUFFICIENT_BUFFER,
+			"target string is not terminated within its length limit", completed));
 	}
 
 	const ModuleRange* AnalysisSession::module_for(TargetAddress a_address) const noexcept
@@ -270,7 +429,10 @@ namespace Crash::Introspection::ReadOnly
 	AnalysisSession::decode_rtti(TargetAddress a_address)
 	{
 		auto vtable = read_pod<std::uint64_t>(a_address);
-		if (!vtable || !module_for(TargetAddress(vtable->value)))
+		if (!vtable)
+			return std::unexpected(vtable.error());
+		const auto* vtableImage = module_for(TargetAddress(vtable->value));
+		if (!vtableImage)
 			return std::unexpected(error(
 				Capture::ErrorCode::kInvalidMetadata,
 				ERROR_INVALID_DATA,
@@ -280,42 +442,271 @@ namespace Crash::Introspection::ReadOnly
 				Capture::ErrorCode::kInvalidMetadata,
 				ERROR_INVALID_DATA,
 				"object vtable address underflows RTTI locator slot"));
-		auto locatorPointer = read_pod<std::uint64_t>(
-			TargetAddress(vtable->value - sizeof(std::uint64_t)));
-		if (!locatorPointer)
-			return std::unexpected(locatorPointer.error());
-		const auto* image = module_for(TargetAddress(locatorPointer->value));
-		if (!image)
+		const auto locatorSlot =
+			TargetAddress(vtable->value - sizeof(std::uint64_t));
+		if (!module_contains(*vtableImage, locatorSlot, sizeof(std::uint64_t)))
 			return std::unexpected(error(
 				Capture::ErrorCode::kInvalidMetadata,
 				ERROR_INVALID_DATA,
-				"RTTI complete-object locator is outside the module catalog"));
+				"RTTI locator slot is outside the vtable module"));
+		auto locatorPointer = read_pod<std::uint64_t>(locatorSlot);
+		if (!locatorPointer)
+			return std::unexpected(locatorPointer.error());
+		const auto* image = module_for(TargetAddress(locatorPointer->value));
+		if (!image || image != vtableImage ||
+			!module_contains(
+				*image,
+				TargetAddress(locatorPointer->value),
+				sizeof(CompleteObjectLocator)))
+			return std::unexpected(error(
+				Capture::ErrorCode::kInvalidMetadata,
+				ERROR_INVALID_DATA,
+				"RTTI complete-object locator is outside the vtable module"));
 		auto locator = read_pod<CompleteObjectLocator>(
 			TargetAddress(locatorPointer->value));
-		if (!locator ||
-			locator->value.signature != 1 ||
+		if (!locator)
+			return std::unexpected(locator.error());
+		if (locator->value.signature != 1 ||
 			locator->value.offset > 0x10000 ||
 			locator->value.selfRva >= image->size ||
 			locatorPointer->value - image->base != locator->value.selfRva ||
-			locator->value.typeDescriptorRva >= image->size)
+			locator->value.typeDescriptorRva == 0 ||
+			locator->value.classDescriptorRva == 0 ||
+			locator->value.offset > a_address.value())
 			return std::unexpected(error(
 				Capture::ErrorCode::kInvalidMetadata,
 				ERROR_INVALID_DATA,
 				"RTTI complete-object locator failed image validation"));
-		auto name = read_c_string(
-			TargetAddress(image->base + locator->value.typeDescriptorRva + 16));
-		if (!name || name->empty())
-			return std::unexpected(name ?
-				error(
+		if (locator->value.constructorDisplacement != 0)
+			return std::unexpected(error(
+				Capture::ErrorCode::kUnavailable,
+				ERROR_NOT_SUPPORTED,
+				"RTTI construction displacement layout is unsupported"));
+
+		auto read_type_name =
+			[this, image](std::uint32_t a_typeDescriptorRva)
+			-> std::expected<std::string, Capture::Error>
+		{
+			auto descriptor = module_rva(
+				*image,
+				a_typeDescriptorRva,
+				17,
+				"RTTI type descriptor");
+			if (!descriptor)
+				return std::unexpected(descriptor.error());
+			auto nameAddress = descriptor->add(16);
+			if (!nameAddress)
+				return std::unexpected(nameAddress.error());
+			const auto available = static_cast<std::size_t>(
+				std::min<std::uint64_t>(
+					m_budgets.maximumStringBytes,
+					image->size - a_typeDescriptorRva - 16));
+			auto name = read_c_string(*nameAddress, available);
+			if (!name)
+				return std::unexpected(name.error());
+			if (name->empty())
+				return std::unexpected(error(
 					Capture::ErrorCode::kInvalidMetadata,
 					ERROR_INVALID_DATA,
-					"RTTI type descriptor has an empty name") :
-				name.error());
-		return RttiResult{
+					"RTTI type descriptor has an empty name"));
+			return name;
+		};
+
+		auto name = read_type_name(locator->value.typeDescriptorRva);
+		if (!name || name->empty())
+			return std::unexpected(name.error());
+		RttiResult result{
 			.decoratedName = std::move(*name),
 			.completeObject = a_address.value() - locator->value.offset,
 			.baseOffset = locator->value.offset
 		};
+
+		auto hierarchyAddress = module_rva(
+			*image,
+			locator->value.classDescriptorRva,
+			sizeof(ClassHierarchyDescriptor),
+			"RTTI class hierarchy descriptor");
+		if (!hierarchyAddress)
+		{
+			result.hierarchyUnavailable =
+				"invalid RTTI class hierarchy descriptor";
+			return result;
+		}
+		auto hierarchy = read_pod<ClassHierarchyDescriptor>(*hierarchyAddress);
+		if (!hierarchy)
+		{
+			result.hierarchyUnavailable =
+				hierarchy.error().code == Capture::ErrorCode::kBudgetExceeded ?
+				"RTTI class hierarchy analysis budget exhausted" :
+				"RTTI class hierarchy descriptor unreadable";
+			return result;
+		}
+		if (hierarchy->value.signature != 0 ||
+			(hierarchy->value.attributes & ~0x7u) != 0 ||
+			hierarchy->value.baseClassCount == 0 ||
+			hierarchy->value.baseClassCount > kMaximumRttiBaseClasses ||
+			hierarchy->value.baseClassArrayRva == 0)
+		{
+			result.hierarchyUnavailable =
+				"invalid bounded RTTI class hierarchy metadata";
+			return result;
+		}
+		if ((hierarchy->value.attributes & 0x4u) != 0)
+		{
+			result.hierarchyUnavailable =
+				"ambiguous RTTI class hierarchy";
+			return result;
+		}
+
+		std::array<std::uint32_t, kMaximumRttiBaseClasses> descriptorRvas{};
+		const auto descriptorArraySize =
+			hierarchy->value.baseClassCount * sizeof(std::uint32_t);
+		auto descriptorArrayAddress = module_rva(
+			*image,
+			hierarchy->value.baseClassArrayRva,
+			descriptorArraySize,
+			"RTTI base-class array");
+		if (!descriptorArrayAddress)
+		{
+			result.hierarchyUnavailable =
+				"invalid RTTI base-class array";
+			return result;
+		}
+		auto descriptorArray = read_bytes(
+			*descriptorArrayAddress,
+			std::span<std::byte>{
+				reinterpret_cast<std::byte*>(descriptorRvas.data()),
+				descriptorArraySize });
+		if (!descriptorArray)
+		{
+			result.hierarchyUnavailable =
+				descriptorArray.error().code == Capture::ErrorCode::kBudgetExceeded ?
+				"RTTI base-class array analysis budget exhausted" :
+				"RTTI base-class array unreadable";
+			return result;
+		}
+
+		result.bases.reserve(hierarchy->value.baseClassCount);
+		bool sawVirtualBase{};
+		for (std::size_t index = 0;
+			 index < hierarchy->value.baseClassCount;
+			 ++index)
+		{
+			if (descriptorRvas[index] == 0)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					"RTTI base-class descriptor has a null RVA";
+				return result;
+			}
+			auto descriptorAddress = module_rva(
+				*image,
+				descriptorRvas[index],
+				sizeof(BaseClassDescriptor),
+				"RTTI base-class descriptor");
+			if (!descriptorAddress)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					"invalid RTTI base-class descriptor";
+				return result;
+			}
+			auto descriptor = read_pod<BaseClassDescriptor>(*descriptorAddress);
+			if (!descriptor)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					descriptor.error().code == Capture::ErrorCode::kBudgetExceeded ?
+					"RTTI base-class descriptor analysis budget exhausted" :
+					"RTTI base-class descriptor unreadable";
+				return result;
+			}
+			if (descriptor->value.typeDescriptorRva == 0 ||
+				descriptor->value.containedBaseCount >=
+					hierarchy->value.baseClassCount - index ||
+				(descriptor->value.attributes & ~0x7Fu) != 0)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					"invalid RTTI base-class descriptor metadata";
+				return result;
+			}
+			if (index == 0 &&
+				(descriptor->value.typeDescriptorRva != locator->value.typeDescriptorRva ||
+					descriptor->value.pmd.memberDisplacement != 0 ||
+					descriptor->value.pmd.vbtableDisplacement != -1))
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable = "RTTI hierarchy root does not match the complete object";
+				return result;
+			}
+			auto baseName =
+				read_type_name(descriptor->value.typeDescriptorRva);
+			if (!baseName)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					baseName.error().code == Capture::ErrorCode::kBudgetExceeded ?
+					"RTTI base type-name analysis budget exhausted" :
+					"RTTI base type descriptor unreadable";
+				return result;
+			}
+
+			RttiBase base{ .decoratedName = std::move(*baseName) };
+			const auto& pmd = descriptor->value.pmd;
+			const auto isAmbiguous =
+				(descriptor->value.attributes & 0x2u) != 0;
+			const auto isVirtual =
+				(descriptor->value.attributes & 0x10u) != 0;
+			const auto hasVirtualPmd = pmd.vbtableDisplacement >= 0;
+			if (isVirtual != hasVirtualPmd)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					"inconsistent virtual-base PMD metadata";
+				return result;
+			}
+			if (isVirtual)
+			{
+				sawVirtualBase = true;
+				base.unavailableReason = isAmbiguous ?
+					"ambiguous RTTI base" :
+					"virtual RTTI base layout unsupported";
+			}
+			else if (pmd.vbtableDisplacement != -1 ||
+				pmd.memberDisplacement < 0 ||
+				static_cast<std::uint64_t>(pmd.memberDisplacement) >
+					kMaximumBaseDisplacement)
+			{
+				result.bases.clear();
+				result.hierarchyUnavailable =
+					"invalid non-virtual PMD metadata";
+				return result;
+			}
+			else if (isAmbiguous)
+				base.unavailableReason = "ambiguous RTTI base";
+			else
+			{
+				auto baseAddress = TargetAddress(result.completeObject).add(
+					static_cast<std::uint64_t>(pmd.memberDisplacement));
+				if (!baseAddress)
+				{
+					result.bases.clear();
+					result.hierarchyUnavailable =
+						"RTTI base-object address overflow";
+					return result;
+				}
+				base.address = baseAddress->value();
+			}
+			result.bases.push_back(std::move(base));
+		}
+		if (((hierarchy->value.attributes & 0x2u) != 0) != sawVirtualBase)
+		{
+			result.bases.clear();
+			result.hierarchyUnavailable =
+				"inconsistent virtual-inheritance hierarchy metadata";
+		}
+		return result;
 	}
 
 	bool AnalysisSession::begin_object(TargetAddress a_address)
@@ -364,8 +755,11 @@ namespace Crash::Introspection::ReadOnly
 				return "<unavailable: BSStringPoolEntry length exceeds budget>";
 			if ((entry->value.flags & kStringWide) != 0)
 				return "<unavailable: wide BSStringPoolEntry>";
+			auto dataAddress = TargetAddress(current).add(sizeof(StringPoolEntry));
+			if (!dataAddress)
+				return "<unavailable: BSStringPoolEntry data address overflow>";
 			auto value = read_c_string(
-				TargetAddress(current + sizeof(StringPoolEntry)),
+				*dataAddress,
 				length + 1);
 			return value ? *value : "<unavailable: BSStringPoolEntry data unreadable>";
 		}
@@ -378,8 +772,57 @@ namespace Crash::Introspection::ReadOnly
 		std::size_t)
 	{
 		std::vector<std::string> fields;
-		const auto complete = TargetAddress(a_rtti.completeObject);
-		if (looks_like_form(a_rtti.decoratedName))
+		if (m_profile == RuntimeProfile::kUnsupported)
+			return "RuntimeFields=<unsupported profile: generic RTTI and raw memory only>";
+		if (!a_rtti.hierarchyUnavailable.empty())
+			return fmt::format(
+				"RuntimeFields=<unavailable: {}>",
+				a_rtti.hierarchyUnavailable);
+
+		auto read_at = [this]<class T>(
+			TargetAddress a_base,
+			std::uint64_t a_offset)
+			-> std::expected<Capture::ReadObjectResult<T>, Capture::Error>
+		{
+			auto address = a_base.add(a_offset);
+			if (!address)
+				return std::unexpected(address.error());
+			return read_pod<T>(*address);
+		};
+		auto find_base = [&a_rtti](
+			std::string_view a_name,
+			std::string& a_reason) -> const RttiBase*
+		{
+			const RttiBase* found{};
+			for (const auto& base : a_rtti.bases)
+			{
+				if (base.decoratedName != a_name)
+					continue;
+				if (found)
+				{
+					a_reason = "ambiguous duplicate RTTI base";
+					return nullptr;
+				}
+				found = std::addressof(base);
+			}
+			if (found && !found->unavailableReason.empty())
+			{
+				a_reason = found->unavailableReason;
+				return nullptr;
+			}
+			return found;
+		};
+		auto has_type = [&a_rtti](std::string_view a_name)
+		{
+			for (const auto& base : a_rtti.bases)
+				if (base.decoratedName == a_name)
+					return true;
+			return false;
+		};
+
+		std::string reason;
+		const auto* formBase = find_base(kTesForm, reason);
+		if (formBase)
 		{
 			struct FormScalars
 			{
@@ -389,8 +832,9 @@ namespace Crash::Introspection::ReadOnly
 				std::uint8_t formType{};
 				std::uint8_t padding{};
 			};
-			auto values = read_pod<FormScalars>(
-				TargetAddress(complete.value() + 0x10));
+			auto values = read_at.operator()<FormScalars>(
+				TargetAddress(formBase->address),
+				0x10);
 			if (values)
 			{
 				fields.push_back(fmt::format("Flags=0x{:08X}", values->value.flags));
@@ -406,17 +850,41 @@ namespace Crash::Introspection::ReadOnly
 			fields.push_back(
 				"SourceFiles=<unavailable: bounded TESFileArray layout was not verified>");
 		}
+		else if (!reason.empty())
+			fields.push_back(fmt::format(
+				"TESForm fields=<unavailable: {}>",
+				reason));
 
-		if (a_rtti.decoratedName.find("NiObjectNET") != std::string::npos ||
-			a_rtti.decoratedName.find("NiAVObject") != std::string::npos)
+		reason.clear();
+		const auto* objectNetBase = find_base(kNiObjectNet, reason);
+		if (objectNetBase)
 		{
-			const auto name = read_fixed_string(TargetAddress(complete.value() + 0x10));
-			fields.push_back(name.empty() ? "Name=<empty>" : fmt::format("Name=\"{}\"", name));
+			auto nameAddress = TargetAddress(objectNetBase->address).add(0x10);
+			if (!nameAddress)
+				fields.push_back("Name=<unavailable: address overflow>");
+			else
+			{
+				const auto name = read_fixed_string(*nameAddress);
+				fields.push_back(name.empty() ?
+					"Name=<empty>" :
+					fmt::format("Name=\"{}\"", name));
+			}
 		}
-		if (a_rtti.decoratedName.find("NiAVObject") != std::string::npos)
+		else if (!reason.empty())
+			fields.push_back(fmt::format(
+				"NiObjectNET fields=<unavailable: {}>",
+				reason));
+
+		reason.clear();
+		const auto* avObjectBase = find_base(kNiAvObject, reason);
+		if (avObjectBase)
 		{
-			auto parent = read_pod<std::uint64_t>(TargetAddress(complete.value() + 0x28));
-			auto flags = read_pod<std::uint64_t>(TargetAddress(complete.value() + 0x108));
+			auto parent = read_at.operator()<std::uint64_t>(
+				TargetAddress(avObjectBase->address),
+				0x28);
+			auto flags = read_at.operator()<std::uint64_t>(
+				TargetAddress(avObjectBase->address),
+				0x108);
 			fields.push_back(parent ?
 				fmt::format("Parent=0x{:016X}", parent->value) :
 				"Parent=<unavailable>");
@@ -425,12 +893,21 @@ namespace Crash::Introspection::ReadOnly
 				"Flags=<unavailable>");
 			fields.push_back(unavailable("TESObjectREFR for 3D"));
 		}
-		if (a_rtti.decoratedName.find("TESObjectREFR") != std::string::npos)
+		else if (!reason.empty())
+			fields.push_back(fmt::format(
+				"NiAVObject fields=<unavailable: {}>",
+				reason));
+
+		reason.clear();
+		const auto* refrBase = find_base(kTesObjectRefr, reason);
+		if (refrBase)
 		{
-			auto parentCell = read_pod<std::uint64_t>(
-				TargetAddress(complete.value() + 0xB8));
-			auto base = read_pod<std::uint64_t>(
-				TargetAddress(complete.value() + 0xC0));
+			auto parentCell = read_at.operator()<std::uint64_t>(
+				TargetAddress(refrBase->address),
+				0xB8);
+			auto base = read_at.operator()<std::uint64_t>(
+				TargetAddress(refrBase->address),
+				0xE0);
 			fields.push_back(parentCell ?
 				fmt::format("ParentCell=0x{:016X}", parentCell->value) :
 				"ParentCell=<unavailable>");
@@ -440,12 +917,21 @@ namespace Crash::Introspection::ReadOnly
 			fields.push_back(
 				"LeveledBase=<unavailable: ExtraDataList container decoding not verified for this runtime>");
 		}
-		if (a_rtti.decoratedName.find("TESQuest") != std::string::npos)
+		else if (!reason.empty())
+			fields.push_back(fmt::format(
+				"TESObjectREFR fields=<unavailable: {}>",
+				reason));
+
+		reason.clear();
+		const auto* questBase = find_base(kTesQuest, reason);
+		if (questBase)
 		{
-			auto stage = read_pod<std::uint16_t>(
-				TargetAddress(complete.value() + 0x2B4));
-			auto alreadyRun = read_pod<std::uint8_t>(
-				TargetAddress(complete.value() + 0x2B6));
+			auto stage = read_at.operator()<std::uint16_t>(
+				TargetAddress(questBase->address),
+				0x2B4);
+			auto alreadyRun = read_at.operator()<std::uint8_t>(
+				TargetAddress(questBase->address),
+				0x2B6);
 			fields.push_back(stage ?
 				fmt::format("CurrentStage={}", stage->value) :
 				"CurrentStage=<unavailable>");
@@ -453,7 +939,12 @@ namespace Crash::Introspection::ReadOnly
 				fmt::format("AlreadyRun={}", alreadyRun->value != 0) :
 				"AlreadyRun=<unavailable>");
 		}
-		if (a_rtti.decoratedName.find("CodeTasklet") != std::string::npos)
+		else if (!reason.empty())
+			fields.push_back(fmt::format(
+				"TESQuest fields=<unavailable: {}>",
+				reason));
+
+		if (has_type(kCodeTasklet))
 		{
 			fields.push_back(
 				"CapturedScriptFrames=<unavailable: runtime stack layout not verified>");
@@ -465,32 +956,24 @@ namespace Crash::Introspection::ReadOnly
 				"ObjectHandle=<unavailable: raw handle is not a FormID and live handle policy is forbidden>");
 			fields.push_back(unavailable("TranslateIPToLineNumber"));
 		}
-		if (a_rtti.decoratedName.find("NiStream") != std::string::npos)
+		if (has_type(kNiStream))
 		{
 			fields.push_back(
 				"FixedArrays/Header=<unavailable: NiStream layout not verified for captured runtime>");
 			fields.push_back(unavailable("Virtual resource stream name"));
 		}
-		if (a_rtti.decoratedName.find("NativeFunctionBase") !=
-			std::string::npos)
+		if (has_type(kNativeFunctionBase))
 			fields.push_back(
 				"Object/Function/State=<unavailable: direct Papyrus layout not verified; virtual getters forbidden>");
-		if (a_rtti.decoratedName.find("ObjectTypeInfo") !=
-			std::string::npos)
+		if (has_type(kObjectTypeInfo))
 			fields.push_back(
 				"Name/DocString=<unavailable: direct ObjectTypeInfo layout not verified>");
-		if (a_rtti.decoratedName.find("BSShaderProperty") !=
-			std::string::npos)
+		if (has_type(kBsShaderProperty))
 			fields.push_back(
 				"ShaderName/Flags/Extra=<unavailable: direct shader layout not verified; virtual getters forbidden>");
-		if (a_rtti.decoratedName.find("TESFullName") !=
-			std::string::npos)
+		if (has_type(kTesFullName))
 			fields.push_back(
 				"FullNameStorage=<unavailable: localized-string subobject offset not verified>");
-
-		if (m_profile == RuntimeProfile::kUnsupported)
-			fields.push_back(
-				"RuntimeFields=<unsupported profile: generic RTTI and raw memory only>");
 
 		std::string joined;
 		for (const auto& field : fields)
@@ -510,25 +993,45 @@ namespace Crash::Introspection::ReadOnly
 			return {};
 		if (const auto found = m_results.find(a_address.value());
 			found != m_results.end())
-			return fmt::format(
-				"(already seen{}{})",
-				a_label.empty() ? "" : " at ",
-				a_label);
-		if (!begin_object(a_address))
-			return "<unavailable: object budget or cycle>";
+			return found->second;
+		(void)a_label;
+		if (m_diagnostics.objects >= m_budgets.maximumObjects)
+		{
+			m_diagnostics.objectBudgetExceeded = true;
+			return "<unavailable: object budget>";
+		}
 
 		std::string result;
 		auto rtti = decode_rtti(a_address);
+		const auto objectAddress = rtti ?
+			TargetAddress(rtti->completeObject) :
+			a_address;
+		if (!begin_object(objectAddress) &&
+			(!rtti || !m_fieldResults.contains(rtti->completeObject)))
+			return "<unavailable: object budget or cycle>";
 		if (rtti)
 		{
 			result = fmt::format(
 				"({}*) 0x{:016X}",
 				display_type_name(rtti->decoratedName),
 				a_address.value());
-			const auto fields = decode_known_fields(a_address, *rtti, 0);
-			if (!fields.empty())
-				result += fmt::format(" [{}]", fields);
+			auto fields = m_fieldResults.find(rtti->completeObject);
+			if (fields == m_fieldResults.end())
+				fields = m_fieldResults.emplace(
+					rtti->completeObject,
+					decode_known_fields(a_address, *rtti, 0)).first;
+			if (!fields->second.empty())
+				result += fmt::format(" [{}]", fields->second);
 		}
+		else if (rtti.error().code == Capture::ErrorCode::kBudgetExceeded)
+			result = fmt::format(
+				"(void*) 0x{:016X} [RTTI=<unavailable: analysis budget exhausted>]",
+				a_address.value());
+		else if (rtti.error().code == Capture::ErrorCode::kUnavailable)
+			result = fmt::format(
+				"(void*) 0x{:016X} [RTTI=<unavailable: {}>]",
+				a_address.value(),
+				rtti.error().message);
 		else if (const auto* module = module_for(a_address))
 		{
 			result = fmt::format(

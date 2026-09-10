@@ -120,6 +120,34 @@ namespace Capture
 		}
 	}
 
+	std::string_view frame_provenance_name(FrameProvenance a_provenance) noexcept
+	{
+		switch (a_provenance)
+		{
+		case FrameProvenance::kContextInstruction: return "saved-context IP";
+		case FrameProvenance::kUnwindMetadata: return "unwind metadata";
+		case FrameProvenance::kLeafAssumption: return "leaf assumption";
+		case FrameProvenance::kNullReseed: return "near-null reseed candidate";
+		case FrameProvenance::kStackScanSlot: return "stack-scan candidate";
+		default: return "unknown provenance";
+		}
+	}
+
+	std::string_view saved_walk_status_name(SavedWalkStatus a_status) noexcept
+	{
+		switch (a_status)
+		{
+		case SavedWalkStatus::kComplete: return "complete";
+		case SavedWalkStatus::kFrameLimit: return "frame limit";
+		case SavedWalkStatus::kPartialInvalidContext: return "partial: invalid context";
+		case SavedWalkStatus::kPartialUnreadableStack: return "partial: unreadable stack";
+		case SavedWalkStatus::kPartialInvalidMetadata: return "partial: invalid metadata";
+		case SavedWalkStatus::kPartialLoop: return "partial: loop";
+		case SavedWalkStatus::kPartialBounds: return "partial: stack bounds";
+		default: return "unknown status";
+		}
+	}
+
 	SavedContextWalk walk_saved_context(
 		const CONTEXT& a_savedContext,
 		std::uint64_t a_stackLimit,
@@ -129,7 +157,7 @@ namespace Capture
 	{
 		SavedContextWalk result;
 		if (a_maxFrames == 0 ||
-			a_savedContext.Rip == 0 ||
+			(a_savedContext.Rip == 0 && !a_allowNearNullReseed) ||
 			!inside_stack(
 				a_savedContext.Rsp,
 				a_stackLimit,
@@ -187,6 +215,12 @@ namespace Capture
 		visited.emplace(cursor.Rip, cursor.Rsp);
 		while (result.frames.size() < a_maxFrames)
 		{
+			if (!inside_stack(cursor.Rsp, a_stackLimit, a_stackBase, sizeof(std::uint64_t)))
+			{
+				result.status = SavedWalkStatus::kPartialBounds;
+				result.detail = "no complete return-address slot remains in the captured stack";
+				return result;
+			}
 			const auto previousSp = cursor.Rsp;
 			bool metadata{};
 			bool leaf{};
@@ -200,6 +234,12 @@ namespace Capture
 			{
 				result.status = SavedWalkStatus::kComplete;
 				result.detail = "saved-context unwind reached a null return address";
+				return result;
+			}
+			if (leaf && !plausible_code_address(cursor.Rip))
+			{
+				result.status = SavedWalkStatus::kPartialInvalidMetadata;
+				result.detail = "leaf-assumed return address is not executable";
 				return result;
 			}
 			if (cursor.Rsp <= previousSp)

@@ -24,6 +24,14 @@ namespace Crash
 			return result.has_value();
 		}
 
+		std::expected<std::string, Capture::Error> ReadString(std::uintptr_t a_address)
+		{
+			Introspection::ReadOnly::LiveMemoryReader reader;
+			Introspection::ReadOnly::AnalysisSession session(
+				reader, {}, Introspection::ReadOnly::RuntimeProfile::kUnsupported);
+			return session.read_c_string(Introspection::ReadOnly::TargetAddress(a_address), 512);
+		}
+
 		// Try to demangle a C++ type name using UnDecorateSymbolName
 		std::string DemangleTypeName(const char* mangledName) noexcept
 		{
@@ -150,16 +158,10 @@ namespace Crash
 				std::uintptr_t nameAddress = pTypeInfo + 16;  // Skip pVFTable (8) + _M_spare (8)
 
 				// Read the decorated name (null-terminated string)
-				std::array<char, 512> decoratedName{};
-				for (size_t i = 0; i < decoratedName.size() - 1; ++i)
-				{
-					if (!SafeRead(nameAddress + i, decoratedName[i]))
-						return "<failed to read type name>";
-					if (decoratedName[i] == '\0')
-						break;
-				}
-
-				return DemangleTypeName(decoratedName.data());
+				const auto decoratedName = ReadString(nameAddress);
+				if (!decoratedName)
+					return "<type name unavailable: " + decoratedName.error().message + ">";
+				return DemangleTypeName(decoratedName->c_str());
 			}
 			catch (...)
 			{
@@ -244,32 +246,13 @@ namespace Crash
 						if (messagePtr != 0 && messagePtr >= 0x1000)
 						{
 							// Try to read the string (with a reasonable limit)
-							char messageBuffer[512];
-							std::memset(messageBuffer, 0, sizeof(messageBuffer));
-
-							bool validString = true;
-							for (size_t i = 0; i < sizeof(messageBuffer) - 1; ++i)
-							{
-								if (!SafeRead(messagePtr + i, messageBuffer[i]))
-								{
-									validString = false;
-									break;
-								}
-								if (messageBuffer[i] == '\0')
-								{
-									break;
-								}
-								// Sanity check: only printable ASCII characters and common whitespace
-								const auto ch = static_cast<unsigned char>(messageBuffer[i]);
-								if ((ch < 0x20 && ch != '\t' && ch != '\n' && ch != '\r') || ch > 0x7E)
-								{
-									validString = false;
-									break;
-								}
-							}
-
-							if (validString && messageBuffer[0] != '\0')
-								return std::string(messageBuffer);
+							const auto message = ReadString(messagePtr);
+							if (message && !message->empty() &&
+								std::ranges::all_of(*message, [](unsigned char a_character) {
+									return (a_character >= 0x20 && a_character <= 0x7E) ||
+										a_character == '\t' || a_character == '\n' || a_character == '\r';
+								}))
+								return *message;
 						}
 					}
 				}

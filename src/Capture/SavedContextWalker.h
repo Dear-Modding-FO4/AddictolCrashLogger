@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Capture
@@ -47,6 +48,9 @@ namespace Capture
 		bool nullReseedAttempted{};
 		bool nullReseeded{};
 	};
+
+	[[nodiscard]] std::string_view frame_provenance_name(FrameProvenance a_provenance) noexcept;
+	[[nodiscard]] std::string_view saved_walk_status_name(SavedWalkStatus a_status) noexcept;
 
 	[[nodiscard]] SavedContextWalk walk_saved_context(
 		const CONTEXT& a_savedContext,

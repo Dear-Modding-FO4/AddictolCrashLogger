@@ -149,11 +149,20 @@ namespace Crash::Introspection::ReadOnly
 			std::size_t a_maximum = 0);
 
 	private:
+		struct RttiBase
+		{
+			std::string decoratedName;
+			std::uint64_t address{};
+			std::string unavailableReason;
+		};
+
 		struct RttiResult
 		{
 			std::string decoratedName;
 			std::uint64_t completeObject{};
 			std::uint32_t baseOffset{};
+			std::vector<RttiBase> bases;
+			std::string hierarchyUnavailable;
 		};
 
 		[[nodiscard]] std::expected<RttiResult, Capture::Error> decode_rtti(
@@ -174,6 +183,7 @@ namespace Crash::Introspection::ReadOnly
 		AnalysisDiagnostics m_diagnostics;
 		std::unordered_set<std::uint64_t> m_visited;
 		std::unordered_map<std::uint64_t, std::string> m_results;
+		std::unordered_map<std::uint64_t, std::string> m_fieldResults;
 	};
 
 	[[nodiscard]] RuntimeProfile runtime_profile(

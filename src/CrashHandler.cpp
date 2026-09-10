@@ -19,6 +19,7 @@
 namespace Crash
 {
 	std::filesystem::path crashPath;
+	static std::filesystem::path s_fallbackCrashPath;
 
 	class SEHException : public std::exception
 	{
@@ -99,6 +100,7 @@ namespace Crash
 
 	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except, const ::CONTEXT* a_context)
 	{
+		_contextProvided = a_context != nullptr;
 		const auto exceptionIp = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
 		const bool isNullCall =
 			a_except.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
@@ -112,23 +114,26 @@ namespace Crash
 			std::uint64_t stackBase{};
 			if (Capture::current_thread_stack_bounds(stackLimit, stackBase))
 			{
-				const auto savedWalk = Capture::walk_saved_context(
+				_savedWalk = Capture::walk_saved_context(
 					*a_context,
 					stackLimit,
 					stackBase,
 					500,
 					isNullCall);
-				if (!savedWalk.frames.empty())
+				if (!_savedWalk.frames.empty())
 				{
 					_capturedFrames.clear();
-					_capturedFrames.reserve(savedWalk.frames.size());
-					for (const auto& frame : savedWalk.frames)
+					_capturedFrames.reserve(_savedWalk.frames.size());
+					for (const auto& frame : _savedWalk.frames)
 						_capturedFrames.emplace_back(
 							reinterpret_cast<const void*>(frame.programCounter));
 					_frames = std::span(_capturedFrames);
+					_usingSavedFrames = true;
 					return;
 				}
 			}
+			else
+				_savedWalk.detail = "current thread TEB stack bounds are unavailable";
 		}
 
 		auto [capturedFrames, success] = safe_capture_stacktrace();
@@ -203,7 +208,7 @@ namespace Crash
 		// frame[2] = actual throw site (or ThrowIfFailed wrapper)
 		// We scan for the first non-system frame
 
-		if (_frames.size() < 3)
+		if (!_usingSavedFrames || _frames.size() < 3)
 			return "";
 
 		try
@@ -300,6 +305,23 @@ namespace Crash
 		return fmt::to_string(fmt::to_string(a_size - 1).length());
 	}
 
+	std::span<const Capture::SavedContextFrame> Callstack::get_saved_frames() const noexcept
+	{
+		return _usingSavedFrames ? std::span<const Capture::SavedContextFrame>(_savedWalk.frames) :
+			std::span<const Capture::SavedContextFrame>{};
+	}
+
+	void Callstack::print_capture_status(spdlog::logger& a_log) const
+	{
+		if (_contextProvided)
+			a_log.critical("CALL STACK CAPTURE: {} - {}",
+				Capture::saved_walk_status_name(_savedWalk.status), _savedWalk.detail);
+		else
+			a_log.critical("CALL STACK CAPTURE: saved exception context was not supplied");
+		if (!_usingSavedFrames)
+			a_log.critical("\tHandler-stack fallback: these frames are not a saved-context unwind.");
+	}
+
 	std::string Callstack::get_format(std::size_t a_nameWidth) const
 	{
 		return "\t[{:>"s + get_size_string(_frames.size()) + "}] 0x{:012X} {:>"s + fmt::to_string(a_nameWidth) + "}{}"s;
@@ -311,12 +333,11 @@ namespace Crash
 		PDB::SymbolResolver& a_symbols) const
 	{
 		a_log.critical("PROBABLE CALL STACK:"sv);
+		print_capture_status(a_log);
 
 		// Handle empty stacktrace case (indicates capture failure due to stack corruption)
 		if (_frames.empty()) {
-			a_log.critical("WARNING: Stack trace capture failed - the call stack was likely corrupted.");
-			a_log.critical("         The crash information below may be incomplete or unavailable.");
-			a_log.critical("         Unable to retrieve any stack frames due to stack corruption.");
+			a_log.critical("\tNo frames are available.");
 			return;
 		}
 
@@ -338,7 +359,7 @@ namespace Crash
 				const auto addr = frame.address();
 				const auto mod = Introspection::get_module_for_pointer(addr, a_modules);
 
-				const auto frame_info = mod ? [&]()
+				auto frame_info = mod ? [&]()
 				{
 					try
 					{
@@ -349,6 +370,8 @@ namespace Crash
 						return std::string("[frame info error]");
 					}
 				}() : ""s;
+				frame_info += _usingSavedFrames && i < _savedWalk.frames.size() ?
+					format_frame_provenance(_savedWalk.frames[i]) : " [handler-stack fallback]";
 
 				frame_data.push_back({ addr, mod, frame_info });
 			}
@@ -438,8 +461,9 @@ namespace Crash
 				// FormIDs are always considered relevant as they imply successful introspection
 				const bool is_form_id = full_analysis.starts_with("(FormID");
 				const bool is_readonly_object =
-					full_analysis.starts_with("(.?") ||
-					full_analysis.find("*) 0x") != std::string::npos;
+					!full_analysis.starts_with("(void*)") &&
+					(full_analysis.starts_with("(.?") ||
+						full_analysis.find("*) 0x") != std::string::npos);
 				if (!is_form_id && !is_readonly_object)
 					return;
 
@@ -1773,8 +1797,8 @@ namespace Crash
 			if (!a_exception || !a_exception->ExceptionRecord || !a_exception->ContextRecord)
 				return EXCEPTION_CONTINUE_SEARCH;
 
-			if (a_exception && a_exception->ExceptionRecord && a_exception->ExceptionRecord->ExceptionCode == static_cast<DWORD>(EXCEPTION_STACK_OVERFLOW))
-				::_resetstkoflw();
+			const bool stackOverflow = a_exception->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW;
+			const int stackGuardRestored = stackOverflow ? ::_resetstkoflw() : -1;
 
 			static std::atomic<DWORD> fatalOwner{};
 			const auto currentThreadId = ::GetCurrentThreadId();
@@ -1794,13 +1818,39 @@ namespace Crash
 			const auto coreEvidence = Capture::capture_core_evidence(
 				*a_exception->ExceptionRecord,
 				*a_exception->ContextRecord);
-			const auto coreWrite = Capture::write_core_evidence(coreEvidence);
-			crashLogPath = coreWrite.path;
+			auto coreWrite = Capture::write_core_evidence(coreEvidence);
+			const auto primaryError = coreWrite.systemError;
+			bool usedFallback{};
+			if (!coreWrite.created && !s_fallbackCrashPath.empty())
+			{
+				const auto preparationError = Capture::prepare_fatal_report_directory(s_fallbackCrashPath);
+				if (preparationError == ERROR_SUCCESS)
+				{
+					coreWrite = Capture::write_core_evidence(coreEvidence);
+					usedFallback = coreWrite.created;
+				}
+				else
+					coreWrite.systemError = preparationError;
+			}
 			if (!coreWrite.created)
+			{
+				::OutputDebugStringW(L"Addictol Crash Logger: core report creation failed; no report was written.\n");
+				try
+				{
+					REX::ERROR(
+						"Crash report creation failed (primary error {}, final error {}); no report was written."sv,
+						primaryError, coreWrite.systemError);
+				}
+				catch (const std::exception&)
+				{
+					::OutputDebugStringW(L"Addictol Crash Logger: operational error logging also failed.\n");
+				}
+				fatalOwner.store(0, std::memory_order_release);
 				return EXCEPTION_CONTINUE_SEARCH;
+			}
+			crashLogPath = std::move(coreWrite.path);
 
-			// Everything below is optional enrichment. The raw primary evidence is
-			// already durable at the exact path that will receive the remaining report.
+			// Append to the created file even if the core write was partial; never replace it.
 			_set_se_translator(seh_translator);
 
 			try
@@ -1812,9 +1862,6 @@ namespace Crash
 					if (IsDebuggerPresent())
 						DebugBreak();
 				}
-
-				static std::mutex sync;
-				const std::lock_guard l{ sync };
 
 				const auto modules = Modules::get_loaded_modules();
 				const std::span cmodules{ modules.begin(), modules.end() };
@@ -1870,8 +1917,13 @@ namespace Crash
 				}
 				log->critical("");
 				log->critical("===== OPTIONAL ENRICHMENT =====");
+				if (usedFallback)
+					log->critical("CORE OUTPUT FALLBACK: primary error {}; report written to {}", primaryError, crashLogPath.string());
 				if (!coreWrite.completed)
-					log->critical("CORE WARNING: FlushFileBuffers failed with error {}", coreWrite.systemError);
+					log->critical("CORE WARNING: evidence writing or flushing was incomplete (error {})", coreWrite.systemError);
+				if (stackOverflow)
+					log->critical("Stack guard recovery: {} (stack-overflow reporting remains best-effort)",
+						stackGuardRestored == 0 ? "failed" : "succeeded");
 
 				// Collection to gather relevant objects during analysis
 				RelevantObjectsCollection relevantObjects;
@@ -2007,10 +2059,9 @@ namespace Crash
 				{
 					try
 					{
-						const Callstack* callstack_ptr = callstack ? &(*callstack) : nullptr;
-						Callstack fallback{ *a_exception->ExceptionRecord, a_exception->ContextRecord };
-						if (!callstack_ptr)
-							callstack_ptr = &fallback;
+						if (!callstack)
+							callstack.emplace(*a_exception->ExceptionRecord, a_exception->ContextRecord);
+						const auto* callstack_ptr = &*callstack;
 
 						if (capturedStack.empty())
 						{
@@ -2024,12 +2075,16 @@ namespace Crash
 						}
 
 						const auto probable_frames = callstack_ptr->get_frame_addresses();
+						callstack_ptr->print_capture_status(*log);
 						print_hybrid_callstack_safeguard(
 							*log,
 							probable_frames,
 							capturedStack,
 							cmodules,
-							symbolResolver);
+							symbolResolver,
+							128,
+							64,
+							callstack_ptr->get_saved_frames());
 					}
 					catch (const std::bad_alloc&)
 					{
@@ -2317,27 +2372,58 @@ namespace Crash
 
 	bool Install()
 	{
-		crashPath = GetF4SELogDirectory();
+		const auto defaultPath = GetF4SELogDirectory();
+		crashPath = defaultPath;
+		s_fallbackCrashPath.clear();
 
 		auto crashLogDirectory = Settings::sCrashLogDirectory.GetValue();
 		if (!crashLogDirectory.empty())
 		{
-			if (std::filesystem::exists(crashLogDirectory) && std::filesystem::is_directory(crashLogDirectory))
+			std::error_code error;
+			if (std::filesystem::is_directory(crashLogDirectory, error) && !error)
 				crashPath = crashLogDirectory;
+			else
+				REX::WARN("Configured crash directory is unavailable; using the F4SE log directory."sv);
 		}
 
-		REX::INFO("Crash Log Directory: {}"sv, crashPath.string());
-		{
+		const auto prepareDirectory = [](const std::filesystem::path& a_path) {
 			std::error_code directoryError;
-			std::filesystem::create_directories(crashPath, directoryError);
-			if (directoryError ||
-				!Capture::prepare_fatal_report_directory(crashPath))
+			if (a_path.empty())
 			{
-				REX::FAIL(
-					"Failed to prepare the crash evidence directory (error {})"sv,
-					directoryError.value());
+				REX::ERROR("Crash evidence directory is empty."sv);
+				return false;
 			}
+			std::filesystem::create_directories(a_path, directoryError);
+			if (directoryError)
+			{
+				REX::ERROR("Could not create crash evidence directory {}: {}"sv, a_path.string(), directoryError.message());
+				return false;
+			}
+			const auto preparationError = Capture::prepare_fatal_report_directory(a_path);
+			if (preparationError != ERROR_SUCCESS)
+			{
+				REX::ERROR("Could not prepare crash evidence directory {} (Windows error {})"sv,
+					a_path.string(), preparationError);
+				return false;
+			}
+			return true;
+		};
+		if (!prepareDirectory(crashPath))
+		{
+			if (crashPath == defaultPath || !prepareDirectory(defaultPath))
+				return false;
+			crashPath = defaultPath;
 		}
+		if (crashPath != defaultPath && !defaultPath.empty())
+		{
+			std::error_code error;
+			std::filesystem::create_directories(defaultPath, error);
+			if (!error)
+				s_fallbackCrashPath = defaultPath;
+			else
+				REX::WARN("The F4SE fallback report directory could not be prepared: {}"sv, error.message());
+		}
+		REX::INFO("Crash Log Directory: {}"sv, crashPath.string());
 
 		{
 			ULONG stackGuarantee = 64 * 1024;
@@ -2346,7 +2432,10 @@ namespace Crash
 
 		const auto success = ::AddVectoredExceptionHandler(1, reinterpret_cast<::PVECTORED_EXCEPTION_HANDLER>(&VectoredExceptions));
 		if (success == nullptr)
-			REX::FAIL("Failed to Install Vectored Exception Handler"sv);
+		{
+			REX::ERROR("Failed to install vectored exception handler (Windows error {})"sv, ::GetLastError());
+			return false;
+		}
 
 		REX::INFO("Installed Crash Handlers"sv);
 

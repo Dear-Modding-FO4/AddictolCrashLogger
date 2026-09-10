@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Capture/SavedContextWalker.h"
 #include "Introspection/ReadonlyIntrospection.h"
 #include "Modules/ModuleHandler.h"
 
@@ -121,6 +122,7 @@ namespace Crash
 		const void* a_address,
 		const Modules::Module* a_module,
 		PDB::SymbolResolver& a_symbols);
+	[[nodiscard]] std::string format_frame_provenance(const Capture::SavedContextFrame& a_frame);
 
 	// Generic frame data for unified callstack printing
 	struct FrameData
@@ -169,6 +171,7 @@ namespace Crash
 	{
 		const void* address;
 		HybridFrameSource source;
+		std::size_t probableIndex{};
 	};
 
 	[[nodiscard]] std::vector<HybridFrame> build_hybrid_callstack(
@@ -193,7 +196,8 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames = 128,
-		std::size_t a_max_inserted_frames = 64);
+		std::size_t a_max_inserted_frames = 64,
+		std::span<const Capture::SavedContextFrame> a_savedFrames = {});
 
 	void print_hybrid_callstack_safeguard(
 		spdlog::logger& a_log,
@@ -202,7 +206,8 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames = 128,
-		std::size_t a_max_inserted_frames = 64);
+		std::size_t a_max_inserted_frames = 64,
+		std::span<const Capture::SavedContextFrame> a_savedFrames = {});
 
 	// Minidump generation (shared between crash logs and thread dumps)
 

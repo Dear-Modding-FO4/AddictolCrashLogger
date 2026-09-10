@@ -152,25 +152,21 @@ namespace Capture
 		return evidence;
 	}
 
-	bool prepare_fatal_report_directory(const std::filesystem::path& a_directory) noexcept
+	DWORD prepare_fatal_report_directory(const std::filesystem::path& a_directory) noexcept
 	{
-		try
-		{
-			const auto path = a_directory.native();
-			if (path.empty() || path.size() + 1 >= s_directory.size())
-				return false;
-			std::ranges::copy(path, s_directory.begin());
-			std::uint32_t size = static_cast<std::uint32_t>(path.size());
-			if (s_directory[size - 1] != L'\\' && s_directory[size - 1] != L'/')
-				s_directory[size++] = L'\\';
-			s_directory[size] = L'\0';
-			s_directoryLength.store(size, std::memory_order_release);
-			return true;
-		}
-		catch (...)
-		{
-			return false;
-		}
+		s_directoryLength.store(0, std::memory_order_release);
+		const auto& path = a_directory.native();
+		if (path.empty() || path.find(L'\0') != std::wstring::npos)
+			return ERROR_INVALID_NAME;
+		if (path.size() + 1 >= s_directory.size())
+			return ERROR_FILENAME_EXCED_RANGE;
+		std::ranges::copy(path, s_directory.begin());
+		std::uint32_t size = static_cast<std::uint32_t>(path.size());
+		if (s_directory[size - 1] != L'\\' && s_directory[size - 1] != L'/')
+			s_directory[size++] = L'\\';
+		s_directory[size] = L'\0';
+		s_directoryLength.store(size, std::memory_order_release);
+		return ERROR_SUCCESS;
 	}
 
 	CoreWriteResult write_core_evidence(const CoreEvidence& a_evidence) noexcept

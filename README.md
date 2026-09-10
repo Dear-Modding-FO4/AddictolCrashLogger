@@ -26,12 +26,16 @@ code, flags and parameters; original exception address; saved RIP/RSP and genera
 registers; PID and TID), flush it, and then append best-effort enrichment to the
 same collision-safe report path. Symbols, modules, settings, retention and
 minidumps are deferred until the core prefix exists.
+Directory setup failures do not terminate the game. If the configured output
+fails during a crash, the logger can retry the prepared F4SE log directory.
 
 Automatic crash inspection and manual thread reports share bounded, strictly
 read-only object decoding. Verified direct fields are preserved where available;
 fields that require virtual engine calls, global VM/data-handler state, handle
 lookups, or unverified layouts are printed as unavailable. Shared image/mapped
 reads keep explicit weak-provenance diagnostics.
+Crash stacks retain unwind provenance and partial-walk status; only scanned
+candidates are deduplicated, not genuine recursive frames.
 
 Manual thread reports capture the process once with Windows Process Snapshotting
 (PSS), use captured contexts, module catalog and VA clone for analysis, and can
@@ -39,6 +43,8 @@ write a minidump from that same HPSS before analysis. There is no per-thread
 suspension loop and no live fallback after PSS failure. Heap-allocation ownership
 probing is retired; its settings are no longer shipped or exposed in the menu.
 Old custom TOML entries are ignored and left untouched.
+Manual object analysis shares the report budget fairly between threads and scans
+at most 512 stack entries per thread, with per-thread partial-status reporting.
 Manual snapshot reports require Windows 8.1 or later; unavailable or failed
 snapshot capture is reported explicitly rather than reverting to live inspection.
 

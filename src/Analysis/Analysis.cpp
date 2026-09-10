@@ -474,6 +474,15 @@ namespace Crash
 		return result;
 	}
 
+	std::string format_frame_provenance(const Capture::SavedContextFrame& a_frame)
+	{
+		auto result = fmt::format(" [{}; SP=0x{:016X}]",
+			Capture::frame_provenance_name(a_frame.provenance), a_frame.stackPointer);
+		if (a_frame.sourceSlot != 0)
+			result += fmt::format(" [source slot=0x{:016X}]", a_frame.sourceSlot);
+		return result;
+	}
+
 	std::vector<const void*> scan_stack_for_frames(
 		std::span<const std::size_t> a_stack,
 		std::span<const module_pointer> a_modules,
@@ -481,6 +490,9 @@ namespace Crash
 	{
 		std::vector<const void*> frames;
 		frames.reserve(std::min(a_max_frames, a_stack.size()));
+		if (a_max_frames == 0)
+			return frames;
+		std::unordered_set<const void*> seen;
 
 		for (const auto value : a_stack)
 		{
@@ -498,7 +510,8 @@ namespace Crash
 			const auto protect = mbi.Protect & 0xFF;
 			const bool executable = protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
 			                        protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
-			if (!executable)
+			if (!executable || mbi.State != MEM_COMMIT ||
+				(mbi.Protect & PAGE_GUARD) != 0 || !seen.insert(addr).second)
 				continue;
 
 			frames.push_back(addr);
@@ -518,20 +531,17 @@ namespace Crash
 	{
 		std::vector<HybridFrame> frames;
 		frames.reserve(a_max_total_frames);
+		std::unordered_set<const void*> probableAddresses;
 
-		auto push_frame = [&](const void* a_addr, HybridFrameSource a_source)
-		{
-			if (!a_addr)
-				return;
-			frames.push_back({ a_addr, a_source });
-		};
-
-		for (const auto addr : a_probable_frames)
+		for (std::size_t index = 0; index < a_probable_frames.size(); ++index)
 		{
 			if (frames.size() >= a_max_total_frames)
 				return frames;
-
-			push_frame(addr, HybridFrameSource::Probable);
+			const auto addr = a_probable_frames[index];
+			if (!addr)
+				continue;
+			frames.push_back({ addr, HybridFrameSource::Probable, index });
+			probableAddresses.insert(addr);
 		}
 
 		if (a_stack.empty())
@@ -543,6 +553,8 @@ namespace Crash
 		{
 			if (frames.size() >= a_max_total_frames || inserted >= a_max_inserted_frames)
 				break;
+			if (probableAddresses.contains(addr))
+				continue;
 
 			frames.push_back({ addr, HybridFrameSource::StackScan });
 			++inserted;
@@ -592,7 +604,8 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames,
-		std::size_t a_max_inserted_frames)
+		std::size_t a_max_inserted_frames,
+		std::span<const Capture::SavedContextFrame> a_savedFrames)
 	{
 		a_log.critical("CALL STACK ([P]robable / [S]tack scan):"sv);
 
@@ -602,6 +615,9 @@ namespace Crash
 			a_modules,
 			a_max_total_frames,
 			a_max_inserted_frames);
+		if (a_probable_frames.size() > a_max_total_frames)
+			a_log.critical("\tOutput limited to {} probable frames; captured {}. Stack-scan candidates omitted.",
+				a_max_total_frames, a_probable_frames.size());
 		if (frames.empty())
 		{
 			a_log.critical("\tNone found"sv);
@@ -618,6 +634,12 @@ namespace Crash
 			{
 				const auto mod = Introspection::get_module_for_pointer(frame.address, a_modules);
 				auto frame_info = mod ? format_stack_frame(frame.address, mod, a_symbols) : ""s;
+				if (frame.source == HybridFrameSource::StackScan)
+					frame_info += " [stack-scan candidate]";
+				else if (frame.probableIndex < a_savedFrames.size())
+					frame_info += format_frame_provenance(a_savedFrames[frame.probableIndex]);
+				else
+					frame_info += " [handler-stack fallback]";
 				frame_data.push_back({ frame.address, mod, std::move(frame_info) });
 				source_tags.push_back(frame.source == HybridFrameSource::Probable ? 'P' : 'S');
 			}
@@ -666,7 +688,8 @@ namespace Crash
 		std::span<const module_pointer> a_modules,
 		PDB::SymbolResolver& a_symbols,
 		std::size_t a_max_total_frames,
-		std::size_t a_max_inserted_frames)
+		std::size_t a_max_inserted_frames,
+		std::span<const Capture::SavedContextFrame> a_savedFrames)
 	{
 		__try
 		{
@@ -677,7 +700,8 @@ namespace Crash
 				a_modules,
 				a_symbols,
 				a_max_total_frames,
-				a_max_inserted_frames);
+				a_max_inserted_frames,
+				a_savedFrames);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{

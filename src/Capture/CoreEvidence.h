@@ -40,7 +40,7 @@ namespace Capture
 		const CONTEXT& a_context,
 		std::span<const std::uint16_t> a_runtimeVersion = {}) noexcept;
 
-	[[nodiscard]] bool prepare_fatal_report_directory(
+	[[nodiscard]] DWORD prepare_fatal_report_directory(
 		const std::filesystem::path& a_directory) noexcept;
 
 	[[nodiscard]] CoreWriteResult write_core_evidence(
