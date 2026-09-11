@@ -7,6 +7,7 @@
 #include <atlcomcli.h>
 #include <codecvt>
 #include <comdef.h>
+#include <limits>
 #include <regex>
 #include <unordered_set>
 
@@ -257,10 +258,44 @@ namespace Crash
 			return std::wstring(bstr, SysStringLen(bstr));
 		}
 
+		[[nodiscard]] static bool symbol_contains_rva(IDiaSymbol* a_symbol, DWORD a_rva)
+		{
+			if (!a_symbol)
+				return false;
+
+			DWORD symbolRva{};
+			ULONGLONG symbolLength{};
+			if (a_symbol->get_relativeVirtualAddress(&symbolRva) != S_OK ||
+				a_symbol->get_length(&symbolLength) != S_OK ||
+				symbolLength == 0 ||
+				a_rva < symbolRva)
+			{
+				return false;
+			}
+
+			return static_cast<ULONGLONG>(a_rva - symbolRva) < symbolLength;
+		}
+
+		[[nodiscard]] static bool line_contains_rva(IDiaLineNumber* a_line, DWORD a_rva)
+		{
+			if (!a_line)
+				return false;
+
+			DWORD lineRva{};
+			if (a_line->get_relativeVirtualAddress(&lineRva) != S_OK || a_rva < lineRva)
+				return false;
+
+			DWORD lineLength{};
+			if (a_line->get_length(&lineLength) == S_OK && lineLength != 0)
+				return (a_rva - lineRva) < lineLength;
+
+			return a_rva == lineRva;
+		}
+
 		std::string processSymbol(IDiaSymbol* a_symbol, IDiaSession* a_session, const DWORD& a_rva, std::string_view& a_name, uintptr_t& a_offset, std::string& a_result)
 		{
 			CComBSTR name;
-			if (!a_symbol || a_symbol->get_name(&name) != S_OK || !name)
+			if (!a_symbol || a_symbol->get_name(&name) != S_OK || !name || name.Length() == 0)
 				return a_result;
 
 			// Demangle the symbol name
@@ -275,64 +310,57 @@ namespace Crash
 			else
 				rva = a_rva;
 
-			ULONGLONG length = 0;
-			if (a_symbol->get_length(&length) == S_OK)
+			bool found_source = false;
+			bool found_line = false;
+
+			CComPtr<IDiaEnumLineNumbers> lineNums;
+			if (a_session && a_session->findLinesByRVA(rva, 1, &lineNums) == S_OK && lineNums)
 			{
-				CComPtr<IDiaEnumLineNumbers> lineNums;
-				if (a_session && a_session->findLinesByRVA(rva, length, &lineNums) == S_OK && lineNums)
+				CComPtr<IDiaLineNumber> lineNum;
+				ULONG fetched{};
+				if (lineNums->Next(1, &lineNum, &fetched) == S_OK &&
+					fetched == 1 &&
+					line_contains_rva(lineNum, rva))
 				{
-					bool found_source = false;
-					bool found_line = false;
+					DWORD sline{};
+					CComPtr<IDiaSourceFile> srcFile;
+					CComBSTR fileName;
+					std::string convertedFileName;
 
-					for (uint8_t i = 0; i < 5; ++i) {
-						CComPtr<IDiaLineNumber> lineNum;
-						ULONG fetched{};
-						if (lineNums->Next(1, &lineNum, &fetched) != S_OK || fetched != 1 || !lineNum)
-							break;
-						{
-							found_source = false;
-							found_line = false;
-							DWORD sline{};
-							CComPtr<IDiaSourceFile> srcFile;
-							CComBSTR fileName;
-							std::string convertedFileName;
-
-							if (lineNum->get_sourceFile(&srcFile) == S_OK && srcFile &&
-								srcFile->get_fileName(&fileName) == S_OK && fileName)
-							{
-								convertedFileName = ConvertBSTRToMBS(fileName);
-								found_source = true;
-							}
-
-							if (lineNum->get_lineNumber(&sline) == S_OK)
-								found_line = true;
-
-							if (found_source && found_line)
-								a_result += fmt::format(" {}:{} {}", convertedFileName, +sline ? (uint64_t)sline : 0, demangledName);
-							else if (found_source)
-								a_result += fmt::format(" {} {}", convertedFileName, demangledName);
-							else if (found_line)
-								a_result += fmt::format(" unk_:{} {}", +sline ? (uint64_t)sline : 0, demangledName);
-						}
-					}
-
-					if (!found_source && !found_line)
+					if (lineNum->get_sourceFile(&srcFile) == S_OK && srcFile &&
+						srcFile->get_fileName(&fileName) == S_OK && fileName)
 					{
-						auto sRva = fmt::format("{:X}", rva);
-						bool is_annotated = demangledName.find('[') != std::string::npos;
-						if (!is_annotated)
-						{
-							if (demangledName.ends_with(sRva))
-								sRva = "";
-							else
-								sRva = "_" + sRva;
-						}
-						else
-							sRva.clear();
-
-						a_result += fmt::format(" {}{}", demangledName, sRva);
+						convertedFileName = ConvertBSTRToMBS(fileName);
+						found_source = true;
 					}
+
+					if (lineNum->get_lineNumber(&sline) == S_OK)
+						found_line = true;
+
+					if (found_source && found_line)
+						a_result += fmt::format(" {}:{} {}", convertedFileName, +sline ? (uint64_t)sline : 0, demangledName);
+					else if (found_source)
+						a_result += fmt::format(" {} {}", convertedFileName, demangledName);
+					else if (found_line)
+						a_result += fmt::format(" unk_:{} {}", +sline ? (uint64_t)sline : 0, demangledName);
 				}
+			}
+
+			if (!found_source && !found_line)
+			{
+				auto sRva = fmt::format("{:X}", rva);
+				bool is_annotated = demangledName.find('[') != std::string::npos;
+				if (!is_annotated)
+				{
+					if (demangledName.ends_with(sRva))
+						sRva = "";
+					else
+						sRva = "_" + sRva;
+				}
+				else
+					sRva.clear();
+
+				a_result += fmt::format(" {}{}", demangledName, sRva);
 			}
 
 			if (a_result.empty())
@@ -742,6 +770,8 @@ namespace Crash
 		//https://stackoverflow.com/questions/68412597/determining-source-code-filename-and-line-for-function-using-visual-studio-pdb
 		std::string pdb_details(std::string_view a_name, uintptr_t a_offset)
 		{
+			if (a_offset > std::numeric_limits<DWORD>::max())
+				return {};
 			static std::mutex sync;
 			std::lock_guard l{ sync };
 			std::string result;
@@ -752,62 +782,39 @@ namespace Crash
 				return result;
 
 			const auto rva = static_cast<DWORD>(a_offset);
-			HRESULT hr = S_OK;
-
-			CComPtr<IDiaEnumTables> enumTables;
-			CComPtr<IDiaEnumSymbolsByAddr> enumSymbolsByAddr;
-
-			if (FAILED(hr = session.pSession->getEnumTables(&enumTables)))
-			{
-				auto error = print_hr_failure(hr);
-				LOG::INFO("Failed to getEnumTables for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
-				return result;
-			}
-
-			if (FAILED(hr = session.pSession->getSymbolsByAddr(&enumSymbolsByAddr)))
-			{
-				auto error = print_hr_failure(hr);
-				LOG::INFO("Failed to getSymbolsByAddr for pdb for dll {}+{:07X}\t{}", a_name, a_offset, error);
-				return result;
-			}
 
 			CComPtr<IDiaSymbol> publicSymbol;
-			if (session.pSession->findSymbolByRVA(rva, SymTagEnum::SymTagPublicSymbol, &publicSymbol) == S_OK)
+			std::string publicResult;
+			DWORD publicRva{};
+			if (session.pSession->findSymbolByRVA(rva, SymTagEnum::SymTagPublicSymbol, &publicSymbol) == S_OK && publicSymbol &&
+				publicSymbol->get_relativeVirtualAddress(&publicRva) == S_OK && publicRva <= rva)
 			{
-				auto publicResult = processSymbol(publicSymbol, session.pSession, rva, a_name, a_offset, result);
+				processSymbol(publicSymbol, session.pSession, rva, a_name, a_offset, publicResult);
 
 				// Log the public result (already demangled in processSymbol)
 				LOG::INFO("Public symbol found for {}+{:07X}: {}", a_name, a_offset, publicResult);
 
-				DWORD privateRva;
-				CComPtr<IDiaSymbol> privateSymbol;
-				if (publicSymbol->get_targetRelativeVirtualAddress(&privateRva) == S_OK &&
-					session.pSession->findSymbolByRVA(privateRva, SymTagEnum::SymTagFunction, &privateSymbol) == S_OK)
-				{
-					auto privateResult = processSymbol(privateSymbol, session.pSession, privateRva, a_name, a_offset, result);
-
-					// Log the private result (already demangled in processSymbol)
-					LOG::INFO("Private symbol found for {}+{:07X}: {}", a_name, a_offset, privateResult);
-
-					// Combine results
-					if (!privateResult.empty() && !publicResult.empty())
-						result = fmt::format("{}\t{}", privateResult, publicResult);
-					else if (!privateResult.empty())
-						result = privateResult;
-					else
-						result = publicResult;
-				}
-				else
-					result = publicResult;
 			}
 			else
 				LOG::INFO("No public symbol found for {}+{:07X}", a_name, a_offset);
+
+			std::string privateResult;
+			CComPtr<IDiaSymbol> privateSymbol;
+			if (session.pSession->findSymbolByRVA(rva, SymTagEnum::SymTagFunction, &privateSymbol) == S_OK &&
+				symbol_contains_rva(privateSymbol, rva))
+			{
+				processSymbol(privateSymbol, session.pSession, rva, a_name, a_offset, privateResult);
+				LOG::INFO("Private symbol found for {}+{:07X}: {}", a_name, a_offset, privateResult);
+			}
+			result = privateResult.empty() ? publicResult : privateResult;
 
 			return result;
 		}
 
 		std::string pdb_function_parameters(std::string_view a_name, uintptr_t a_offset)
 		{
+			if (a_offset > std::numeric_limits<DWORD>::max())
+				return {};
 			static std::mutex sync;
 			std::lock_guard l{ sync };
 			std::string result;
@@ -821,8 +828,11 @@ namespace Crash
 			HRESULT hr = S_OK;
 
 			CComPtr<IDiaSymbol> funcSymbol;
-			if (FAILED(hr = session.pSession->findSymbolByRVA(rva, SymTagFunction, &funcSymbol)) || !funcSymbol)
+			if (FAILED(hr = session.pSession->findSymbolByRVA(rva, SymTagFunction, &funcSymbol)) ||
+				!symbol_contains_rva(funcSymbol, rva))
+			{
 				return result;
+			}
 
 			CComPtr<IDiaEnumSymbols> enumSymbols;
 			if (FAILED(hr = funcSymbol->findChildren(SymTagData, NULL, nsNone, &enumSymbols)) || !enumSymbols)

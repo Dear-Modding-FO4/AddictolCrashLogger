@@ -167,7 +167,7 @@ namespace Crash::Modules
 					offset,
 					[](auto&& a_lhs, auto&& a_rhs) noexcept
 					{
-						return a_lhs.offset >= a_rhs;
+						return a_lhs.offset > a_rhs;
 					});
 
 				auto result = super::get_frame_info(a_frame);

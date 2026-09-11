@@ -745,7 +745,7 @@ namespace Crash::Introspection
 			a_modules.rend(),
 			reinterpret_cast<std::uintptr_t>(a_ptr),
 			[](auto&& a_lhs, auto&& a_rhs) noexcept {
-				return a_lhs->address() >= a_rhs;
+				return a_lhs->address() > a_rhs;
 			});
 		return it != a_modules.rend() && (*it)->in_range(a_ptr) ? it->get() : nullptr;
 	}
