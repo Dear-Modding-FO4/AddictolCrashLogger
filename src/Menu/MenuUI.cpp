@@ -26,7 +26,7 @@ namespace CrashUI
 			.requiredServices = DMUI_HOST_SERVICE_EXTERNAL_OPEN,
 			.minimumUIRevision = DMUI_UI_REVISION_1,
 			.minimumUIAPISize = DMUI_UI_API_REQUIRED_SIZE,
-			.minimumHostAPISize = DMUI_HOST_API_DRAW_TEXT_VIEW_SIZE
+			.minimumHostAPISize = DMUI_HOST_API_DRAW_SEARCH_INPUT_BUFFER_SIZE
 		};
 
 		dmui::Client s_client{
@@ -277,8 +277,7 @@ namespace CrashUI
 			(void)s_client.DrawSearchInput(
 				"report-filter",
 				"Filter report filenames...",
-				s_reportFilter,
-				kMaximumSearchQueryBytes);
+				s_reportFilter);
 			if (a_index->loading)
 				(void)dmui::DrawStyledText(s_client, "Indexing reports...");
 			if (!a_index->error.empty())
