@@ -28,7 +28,6 @@ namespace CrashUI
 	inline constexpr size_t kMaximumParsedLineBytes = 8 * 1024;
 	inline constexpr size_t kMaximumSearchQueryBytes = 512;
 	inline constexpr size_t kMaximumSearchHits = 10000;
-	inline constexpr size_t kPreviewLinesPerPage = 200;
 
 	enum class ReportKind
 	{

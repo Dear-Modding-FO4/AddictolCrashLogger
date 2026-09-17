@@ -260,7 +260,7 @@ namespace CrashUI
 			a_snapshot.lineOffsets.clear();
 			a_snapshot.lineOffsets.push_back(0);
 			for (size_t i = 0; i < a_snapshot.text.size(); ++i)
-				if (a_snapshot.text[i] == '\n' && i + 1 < a_snapshot.text.size())
+				if (a_snapshot.text[i] == '\n')
 					a_snapshot.lineOffsets.push_back(i + 1);
 		}
 

@@ -9,7 +9,8 @@ Install [DearModdingUI](https://github.com/Dear-Modding-FO4/DearModdingUI) separ
 for in-game pages:
 
 * **Home:** logger status, versions, and report locations.
-* **Reports:** browse, search, open, and copy saved crash/thread reports. Previews
+* **Reports:** browse, search, open, and copy saved crash/thread reports. The shared
+  DMUI text reader scrolls to sections and highlights search matches. Previews
   are limited to 2 MiB; open the original file for the full report.
 * **Settings:** edit configuration with Reset, Revert, and Apply. Changes are saved
   to `Data\F4SE\Plugins\AddictolCrashLoggerCustom.toml` for the **next game launch**.

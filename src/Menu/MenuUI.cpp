@@ -25,7 +25,8 @@ namespace CrashUI
 			.capabilities = DMUI_CLIENT_CAPABILITY_NONE,
 			.requiredServices = DMUI_HOST_SERVICE_EXTERNAL_OPEN,
 			.minimumUIRevision = DMUI_UI_REVISION_1,
-			.minimumUIAPISize = DMUI_UI_API_REQUIRED_SIZE
+			.minimumUIAPISize = DMUI_UI_API_REQUIRED_SIZE,
+			.minimumHostAPISize = DMUI_HOST_API_DRAW_TEXT_VIEW_SIZE
 		};
 
 		dmui::Client s_client{
@@ -49,13 +50,11 @@ namespace CrashUI
 		bool s_compareActivated{};
 		uint64_t s_selectionGeneration{};
 		std::filesystem::path s_selectedReport;
-		size_t s_previewPage{};
+		dmui::TextViewState s_previewState;
 		std::string s_reportFilter;
 		std::string s_previewSearch;
 		uint64_t s_searchGeneration{};
 		uint64_t s_searchSelectionGeneration{};
-		size_t s_currentSearchHit{ std::string::npos };
-		std::string s_searchStatus;
 		int s_reportKindFilter{};
 		std::filesystem::path s_compareLeft;
 		std::filesystem::path s_compareRight;
@@ -66,47 +65,6 @@ namespace CrashUI
 		SettingsPageState s_settingsState;
 		uint64_t s_nextSaveOperation{ 1 };
 		uint64_t s_settingsViewGeneration{};
-
-		[[nodiscard]] bool HasRequiredHostOperations(
-			const DMUI_HostAPI* a_api) noexcept
-		{
-			if (!a_api || a_api->structSize < DMUI_HOST_API_QUERY_UI_API_SIZE)
-				return false;
-			return a_api->registerClient &&
-				a_api->registerCategory &&
-				a_api->registerPage &&
-				a_api->selectPage &&
-				a_api->registerPageActivityObserver &&
-				a_api->setStatus &&
-				a_api->getThemeColors &&
-				a_api->pushFont &&
-				a_api->popFont &&
-				a_api->drawSectionHeader &&
-				a_api->drawSearchInput &&
-				a_api->drawCollapsingSectionHeader &&
-				a_api->drawSettingsActionButton &&
-				a_api->settingsActionButtonWidth &&
-				a_api->settingsActionButtonExtent &&
-				a_api->beginSettingsTable &&
-				a_api->beginSettingsRow &&
-				a_api->endSettingsRow &&
-				a_api->endSettingsTable &&
-				a_api->drawLinkRow &&
-				a_api->queryServices &&
-				a_api->queryUIAPI &&
-				a_api->openExternal;
-		}
-
-		[[nodiscard]] bool PreflightRequiredHostOperations() noexcept
-		{
-			using GetAPIFn =
-				const DMUI_HostAPI* (DMUI_CALL*)(uint32_t) noexcept;
-			const auto getAPI =
-				dmui::detail::ResolveHostSymbol<GetAPIFn>("DMUI_GetAPI");
-			if (!getAPI)
-				return !dmui::detail::HostModulePresent();
-			return HasRequiredHostOperations(getAPI(DMUI_HOST_ABI_CURRENT));
-		}
 
 		void ReportPresentationFailure() noexcept
 		{
@@ -319,7 +277,8 @@ namespace CrashUI
 			(void)s_client.DrawSearchInput(
 				"report-filter",
 				"Filter report filenames...",
-				s_reportFilter);
+				s_reportFilter,
+				kMaximumSearchQueryBytes);
 			if (a_index->loading)
 				(void)dmui::DrawStyledText(s_client, "Indexing reports...");
 			if (!a_index->error.empty())
@@ -364,7 +323,7 @@ namespace CrashUI
 						dmui::ui::SelectableFlags::kSpanAllColumns))
 				{
 					++s_selectionGeneration;
-					s_previewPage = 0;
+					s_previewState = {};
 					s_previewSearch.clear();
 					if (selected)
 						s_selectedReport.clear();
@@ -390,140 +349,12 @@ namespace CrashUI
 			dmui::ui::EndTable();
 		}
 
-		[[nodiscard]] std::string_view LineAt(
-			const ReportReadSnapshot& a_read,
-			size_t a_line)
-		{
-			if (a_line >= a_read.lineOffsets.size())
-				return {};
-			const auto start = a_read.lineOffsets[a_line];
-			auto end = a_line + 1 < a_read.lineOffsets.size() ?
-				a_read.lineOffsets[a_line + 1] :
-				a_read.text.size();
-			while (end > start &&
-				(a_read.text[end - 1] == '\n' || a_read.text[end - 1] == '\r'))
-				--end;
-			return std::string_view{ a_read.text }.substr(start, end - start);
-		}
-
-		void SelectSearchHit(
-			const ReportReadSnapshot& a_read,
-			const ReportSearchSnapshot& a_search,
-			bool a_forward)
-		{
-			if (a_search.byteOffsets.empty())
-			{
-				s_currentSearchHit = std::string::npos;
-				s_searchStatus = "No matches in the loaded preview.";
-				return;
-			}
-			const auto pageFirstLine = s_previewPage * kPreviewLinesPerPage;
-			const auto pageLastLine = (std::min)(
-				pageFirstLine + kPreviewLinesPerPage,
-				a_read.lineOffsets.size());
-			const auto pageStart =
-				pageFirstLine < a_read.lineOffsets.size() ?
-					a_read.lineOffsets[pageFirstLine] : a_read.text.size();
-			const auto pageEnd =
-				pageLastLine < a_read.lineOffsets.size() ?
-					a_read.lineOffsets[pageLastLine] : a_read.text.size();
-			bool wrapped{};
-			size_t index{};
-			if (s_currentSearchHit == std::string::npos)
-			{
-				if (a_forward)
-				{
-					const auto match = std::lower_bound(
-						a_search.byteOffsets.begin(),
-						a_search.byteOffsets.end(),
-						pageStart);
-					if (match != a_search.byteOffsets.end() && *match < pageEnd)
-						index = static_cast<size_t>(
-							match - a_search.byteOffsets.begin());
-					else if (match != a_search.byteOffsets.end())
-						index = static_cast<size_t>(
-							match - a_search.byteOffsets.begin());
-					else
-						wrapped = true;
-				}
-				else
-				{
-					const auto match = std::lower_bound(
-						a_search.byteOffsets.begin(),
-						a_search.byteOffsets.end(),
-						pageEnd);
-					if (match != a_search.byteOffsets.begin() &&
-						*(match - 1) >= pageStart)
-						index = static_cast<size_t>(
-							(match - 1) - a_search.byteOffsets.begin());
-					else
-					{
-						const auto before = std::lower_bound(
-							a_search.byteOffsets.begin(),
-							a_search.byteOffsets.end(),
-							pageStart);
-						if (before != a_search.byteOffsets.begin())
-							index = static_cast<size_t>(
-								(before - 1) - a_search.byteOffsets.begin());
-						else
-						{
-							index = a_search.byteOffsets.size() - 1;
-							wrapped = true;
-						}
-					}
-				}
-			}
-			else if (a_forward)
-			{
-				const auto match = std::upper_bound(
-					a_search.byteOffsets.begin(),
-					a_search.byteOffsets.end(),
-					s_currentSearchHit);
-				if (match == a_search.byteOffsets.end())
-					wrapped = true;
-				else
-					index = static_cast<size_t>(
-						match - a_search.byteOffsets.begin());
-			}
-			else
-			{
-				const auto match = std::lower_bound(
-					a_search.byteOffsets.begin(),
-					a_search.byteOffsets.end(),
-					s_currentSearchHit);
-				if (match == a_search.byteOffsets.begin())
-				{
-					index = a_search.byteOffsets.size() - 1;
-					wrapped = true;
-				}
-				else
-					index = static_cast<size_t>(
-						(match - 1) - a_search.byteOffsets.begin());
-			}
-			if (wrapped && a_forward)
-				index = 0;
-			s_currentSearchHit = a_search.byteOffsets[index];
-			const auto line = static_cast<size_t>(std::upper_bound(
-				a_read.lineOffsets.begin(),
-				a_read.lineOffsets.end(),
-				s_currentSearchHit) - a_read.lineOffsets.begin() - 1);
-			s_previewPage = line / kPreviewLinesPerPage;
-			s_searchStatus = std::format(
-				"Match {} of {}{}{}.",
-				index + 1,
-				a_search.byteOffsets.size(),
-				a_search.capped ? "+" : "",
-				wrapped ? "; wrapped" : "");
-		}
-
-		void DrawDetailSearch(
+		[[nodiscard]] std::shared_ptr<const ReportSearchSnapshot> DrawDetailSearch(
 			const std::shared_ptr<const ReportReadSnapshot>& a_read)
 		{
 			if (s_searchSelectionGeneration != a_read->selectionGeneration)
 			{
 				s_searchSelectionGeneration = a_read->selectionGeneration;
-				s_currentSearchHit = std::string::npos;
-				s_searchStatus.clear();
 				++s_searchGeneration;
 				if (!s_previewSearch.empty())
 					ReportRepository::GetSingleton().RequestSearch(
@@ -533,32 +364,10 @@ namespace CrashUI
 			}
 			if (s_client.DrawSearchInput(
 					"preview-search",
-					"Search loaded text (literal, case-sensitive)...",
-					s_previewSearch).value_or(false))
+					"Search loaded text (literal, case-sensitive; 512 UTF-8 bytes)...",
+					s_previewSearch,
+					kMaximumSearchQueryBytes).value_or(false))
 			{
-				if (s_previewSearch.size() > kMaximumSearchQueryBytes)
-				{
-					s_previewSearch.resize(kMaximumSearchQueryBytes);
-					auto sequenceStart = s_previewSearch.size() - 1;
-					while (sequenceStart > 0 &&
-						(static_cast<unsigned char>(
-							s_previewSearch[sequenceStart]) & 0xC0u) == 0x80u)
-						--sequenceStart;
-					const auto lead = static_cast<unsigned char>(
-						s_previewSearch[sequenceStart]);
-					const auto sequenceLength =
-						lead < 0x80u ? size_t{ 1 } :
-						lead < 0xE0u ? size_t{ 2 } :
-						lead < 0xF0u ? size_t{ 3 } : size_t{ 4 };
-					if (sequenceStart + sequenceLength >
-						s_previewSearch.size())
-						s_previewSearch.resize(sequenceStart);
-					s_searchStatus =
-						"Query was limited to 512 UTF-8 bytes.";
-				}
-				else
-					s_searchStatus.clear();
-				s_currentSearchHit = std::string::npos;
 				++s_searchGeneration;
 				ReportRepository::GetSingleton().RequestSearch(
 					a_read,
@@ -566,7 +375,7 @@ namespace CrashUI
 					s_searchGeneration);
 			}
 			if (s_previewSearch.empty())
-				return;
+				return {};
 			const auto search =
 				ReportRepository::GetSingleton().SearchSnapshot();
 			const auto current =
@@ -580,7 +389,7 @@ namespace CrashUI
 				(void)dmui::DrawStyledText(
 					s_client,
 					"Searching the loaded preview...");
-				return;
+				return {};
 			}
 			if (!search->error.empty())
 			{
@@ -588,13 +397,8 @@ namespace CrashUI
 					s_client,
 					search->error,
 					{ .tone = dmui::TextTone::kError, .wrapped = true });
-				return;
+				return {};
 			}
-			if (dmui::ui::Button("Previous match"))
-				SelectSearchHit(*a_read, *search, false);
-			dmui::ui::SameLine();
-			if (dmui::ui::Button("Next match"))
-				SelectSearchHit(*a_read, *search, true);
 			if (search->byteOffsets.empty())
 				(void)dmui::DrawStyledText(
 					s_client,
@@ -612,11 +416,7 @@ namespace CrashUI
 					count,
 					{ .tone = dmui::TextTone::kMuted });
 			}
-			if (!s_searchStatus.empty())
-				(void)dmui::DrawStyledText(
-					s_client,
-					s_searchStatus,
-					{ .tone = dmui::TextTone::kMuted });
+			return search;
 		}
 
 		void DrawReportDetails(
@@ -656,71 +456,66 @@ namespace CrashUI
 					a_read->encodingNotice,
 					{ .tone = dmui::TextTone::kMuted, .wrapped = true });
 
-			if (!a_read->metadata.sections.empty())
+			const auto search = DrawDetailSearch(a_read);
+			const dmui::TextViewRequest view{
+				.text = a_read->text,
+				.lineOffsets = a_read->lineOffsets,
+				.matchByteOffsets = search ?
+					std::span<const size_t>{ search->byteOffsets } :
+					std::span<const size_t>{},
+				.matchByteLength = search && !search->byteOffsets.empty() ?
+					search->query.size() : 0,
+				.contentRevision = a_read->selectionGeneration,
+				.matchRevision = search ? search->searchGeneration : 0,
+				.viewport = { 0.0f, dmui::ui::GetFontSize() * 24.0f }
+			};
+			dmui::SynchronizeTextViewState(view, s_previewState);
+			if (!view.matchByteOffsets.empty())
 			{
-				const auto style = s_client.GetStyleMetrics();
-				if (!style)
-					ReportPresentationFailure();
-				else
+				if (dmui::ui::Button("Previous match"))
+					(void)dmui::SelectPreviousTextMatch(view, s_previewState);
+				dmui::ui::SameLine();
+				if (dmui::ui::Button("Next match"))
+					(void)dmui::SelectNextTextMatch(view, s_previewState);
+				if (s_previewState.activeMatch != dmui::kNoTextOffset)
 				{
-					const auto available = dmui::ui::GetContentRegionAvail().x;
-					float usedWidth{};
-					for (const auto& [name, line] : a_read->metadata.sections)
-					{
-						if (available <= 0.0f)
-							break;
-						const auto naturalWidth =
-							dmui::ui::CalcTextSize(name).x + style->framePadding.x * 2.0f;
-						const auto width = (std::min)(naturalWidth, available);
-						if (usedWidth > 0.0f &&
-							usedWidth + style->itemSpacing.x + width <= available)
-						{
-							dmui::ui::SameLine();
-							usedWidth += style->itemSpacing.x;
-						}
-						else
-							usedWidth = 0.0f;
-						const auto label = name + "##section-" + std::to_string(line);
-						if (dmui::ui::Button(label.c_str(), { width, 0.0f }))
-						{
-							s_previewPage = line / kPreviewLinesPerPage;
-							s_currentSearchHit = std::string::npos;
-						}
-						if (naturalWidth > width && dmui::ui::IsItemHovered())
-							dmui::ui::SetTooltip("%s", name.c_str());
-						usedWidth += width;
-					}
+					dmui::ui::SameLine();
+					dmui::ui::TextUnformatted(std::format(
+						"Match {} of {}{} (navigation wraps)",
+						s_previewState.activeMatch + 1,
+						view.matchByteOffsets.size(),
+						search->capped ? "+" : ""));
 				}
 			}
-			DrawDetailSearch(a_read);
-			const auto pageCount = (std::max)(
-				size_t{ 1 },
-				(a_read->lineOffsets.size() + kPreviewLinesPerPage - 1) /
-					kPreviewLinesPerPage);
-			s_previewPage = (std::min)(s_previewPage, pageCount - 1);
-			if (dmui::ui::Button("Previous 200"))
+			const auto style = s_client.GetStyleMetrics();
+			if (!style)
+				ReportPresentationFailure();
+			else if (!a_read->metadata.sections.empty())
 			{
-				s_previewPage = s_previewPage == 0 ? 0 : s_previewPage - 1;
-				s_currentSearchHit = std::string::npos;
+				(void)dmui::DrawTextViewNavigation(
+					"report-sections",
+					std::span{ a_read->metadata.sections },
+					*style,
+					view,
+					s_previewState,
+					[&](const auto& section) {
+						return std::pair{
+							std::string_view{ section.first },
+							a_read->lineOffsets.at(section.second)
+						};
+					});
 			}
-			dmui::ui::SameLine();
-			if (dmui::ui::Button("Next 200"))
+			if (!s_client.DrawTextView("report-preview", view, s_previewState))
 			{
-				s_previewPage = (std::min)(s_previewPage + 1, pageCount - 1);
-				s_currentSearchHit = std::string::npos;
+				const auto result = s_client.LastResult();
+				ReportPresentationFailure();
+				(void)dmui::DrawStyledText(
+					s_client,
+					std::format(
+						"Report preview unavailable ({}). Open Report to inspect the original file.",
+						DMUI_ResultToString(result)),
+					{ .tone = dmui::TextTone::kError, .wrapped = true });
 			}
-			dmui::ui::SameLine();
-			dmui::ui::TextUnformatted(std::format(
-				"Page {} of {}",
-				s_previewPage + 1,
-				pageCount));
-
-			const auto first = s_previewPage * kPreviewLinesPerPage;
-			const auto last = (std::min)(
-				first + kPreviewLinesPerPage,
-				a_read->lineOffsets.size());
-			for (size_t line = first; line < last; ++line)
-				dmui::ui::TextUnformatted(LineAt(*a_read, line));
 
 			(void)s_client.DrawSectionHeader("Explicit local actions");
 			(void)dmui::DrawStyledText(
@@ -738,28 +533,27 @@ namespace CrashUI
 				"Exact summary preview:",
 				{ .fontRole = DMUI_FONT_ROLE_SUBHEADING });
 			dmui::ui::TextUnformatted(a_read->summary);
-			if (!a_read->metadata.summarySources.empty())
+			if (style && !a_read->metadata.summarySources.empty())
 			{
 				(void)dmui::DrawStyledText(
 					s_client,
 					"Summary evidence:",
 					{ .fontRole = DMUI_FONT_ROLE_SUBHEADING });
-				for (const auto& [label, source] :
-					a_read->metadata.summarySources)
-				{
-					dmui::ui::TextUnformatted(label);
-					dmui::ui::SameLine();
-					const auto button = std::format(
-						"Line {}##summary-{}-{}",
-						source.line + 1,
-						label,
-						source.byteOffset);
-					if (dmui::ui::Button(button.c_str()))
-					{
-						s_previewPage = source.line / kPreviewLinesPerPage;
-						s_currentSearchHit = std::string::npos;
-					}
-				}
+				(void)dmui::DrawTextViewNavigation(
+					"summary-sources",
+					std::span{ a_read->metadata.summarySources },
+					*style,
+					view,
+					s_previewState,
+					[](const auto& evidence) {
+						return std::pair{
+							std::format(
+								"{}: line {}",
+								evidence.first,
+								evidence.second.line + 1),
+							evidence.second.byteOffset
+						};
+					});
 			}
 			if (dmui::ui::Button("Copy Selected Summary"))
 				dmui::ui::SetClipboardText(a_read->summary);
@@ -1800,14 +1594,6 @@ namespace CrashUI
 				REX::INFO(
 					"Crash Logger UI: DearModdingUI.dll is not loaded; "
 					"crash logging continues headless."sv);
-				return;
-			}
-			if (!PreflightRequiredHostOperations())
-			{
-				s_installResult.store(false, std::memory_order_relaxed);
-				REX::ERROR(
-					"Crash Logger UI: host is missing required registration, "
-					"navigation, settings, status, theme, link, or external-open operations."sv);
 				return;
 			}
 			if (!s_client.Connect())
