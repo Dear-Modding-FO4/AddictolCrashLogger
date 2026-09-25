@@ -1254,12 +1254,13 @@ namespace Crash
 
 		void print_settings(spdlog::logger& a_log)
 		{
-			std::filesystem::path ConfigFile = "Data/F4SE/Plugins/Addictol.toml";
-			std::filesystem::path CustomConfigFile = "Data/F4SE/Plugins/AddictolCustom.toml";
+			a_log.critical("SETTINGS:"sv);
 
+			std::filesystem::path ConfigFile = "Data/F4SE/Plugins/Addictol.toml";
 			if (!std::filesystem::exists(ConfigFile))
 			{
 				LOG::WARN("Config File was not found at: {}", ConfigFile.string());
+				a_log.critical("	Could not find Addictol's Config File."sv);
 				return;
 			}
 
@@ -1267,6 +1268,7 @@ namespace Crash
 			if (!file.is_open())
 			{
 				LOG::WARN("Failed to open the Config File at: {}", ConfigFile.string());
+				a_log.critical("	Could not read Addictol's Config File."sv);
 				return;
 			}
 
@@ -1275,50 +1277,6 @@ namespace Crash
 				s.erase(0, s.find_first_not_of(" \t"));
 				s.erase(s.find_last_not_of(" \t") + 1);
 			};
-
-			std::unordered_map<std::string, std::string> overrides;
-			if (std::filesystem::exists(CustomConfigFile))
-			{
-				std::ifstream customFile(CustomConfigFile);
-				if (!customFile.is_open())
-					LOG::WARN("Failed to open the Custom Config File at: {}", CustomConfigFile.string());
-				else
-				{
-					std::string customLine;
-					while (std::getline(customFile, customLine))
-					{
-						while (!customLine.empty() && (customLine.back() == '\r' || customLine.back() == '\n'))
-						{
-							customLine.pop_back();
-						}
-
-						// Ignore Empty Lines and Comments
-						if (customLine.empty()) continue;
-						if (customLine[0] == ';' || customLine[0] == '#') continue;
-
-						// Key/Value
-						auto eq_pos = customLine.find('=');
-						if (eq_pos == std::string::npos) continue;
-
-						std::string key = customLine.substr(0, eq_pos);
-						std::string value = customLine.substr(eq_pos + 1);
-
-						// Strip Inline Comments
-						auto comment_pos = value.find_first_of("#;");
-						if (comment_pos != std::string::npos)
-							value = value.substr(0, comment_pos);
-
-						// Trim Whitespace
-						trim(key);
-						trim(value);
-
-						// Add Override
-						overrides[key] = value;
-					}
-				}
-			}
-
-			a_log.critical("SETTINGS:"sv);
 
 			std::string line;
 			std::string current_group;
@@ -1357,10 +1315,6 @@ namespace Crash
 				// Trim Whitespace
 				trim(key);
 				trim(value);
-
-				// Get Override
-				if (const auto it = overrides.find(key); it != overrides.end())
-					value = it->second;
 
 				a_log.critical("\t\t{}: {}", key, value);
 			}
