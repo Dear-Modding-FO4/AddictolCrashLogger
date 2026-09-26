@@ -1256,68 +1256,135 @@ namespace Crash
 		{
 			a_log.critical("SETTINGS:"sv);
 
-			std::filesystem::path ConfigFile = "Data/F4SE/Plugins/Addictol.toml";
-			if (!std::filesystem::exists(ConfigFile))
-			{
-				LOG::WARN("Config File was not found at: {}", ConfigFile.string());
-				a_log.critical("	Could not find Addictol's Config File."sv);
-				return;
-			}
+			// Paths
+			const std::filesystem::path MainConfigFile = "Data/F4SE/Plugins/Addictol.toml";
+			const std::filesystem::path CustomConfigFile = "Data/F4SE/Plugins/AddictolCustom.toml";
 
-			std::ifstream file(ConfigFile);
-			if (!file.is_open())
+			// Setting Sections
+			struct Section
 			{
-				LOG::WARN("Failed to open the Config File at: {}", ConfigFile.string());
-				a_log.critical("	Could not read Addictol's Config File."sv);
-				return;
-			}
-
-			auto trim = [](std::string& s)
-			{
-				s.erase(0, s.find_first_not_of(" \t"));
-				s.erase(s.find_last_not_of(" \t") + 1);
+				std::string sectionName;
+				std::map<std::string, std::string> sectionSettings;
 			};
 
-			std::string line;
-			std::string current_group;
-			while (std::getline(file, line))
+			std::vector<Section> sections;
+
+			// Trim Function
+			auto trim = [](std::string& s)
 			{
-				while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+				const auto first = s.find_first_not_of(" \t\r\n");
+				if (first == std::string::npos)
 				{
-					line.pop_back();
+					s.clear();
+					return;
 				}
 
-				// Ignore Empty Lines and Comments
-				if (line.empty()) continue;
-				if (line[0] == ';' || line[0] == '#') continue;
+				const auto last = s.find_last_not_of(" \t\r\n");
+				s.erase(last + 1);
+				s.erase(0, first);
+			};
 
-				// [GroupName]
-				if (line.front() == '[' && line.back() == ']')
+			// Read Config Function
+			auto readConfig = [&](const std::filesystem::path& configFile)
+			{
+				if (!std::filesystem::exists(configFile))
 				{
-					current_group = line.substr(1, line.size() - 2);
-					a_log.critical("\t[{}]", current_group);
-
-					continue;
+					LOG::WARN("Could not find the Config File at: {}", configFile.string());
+					return;
 				}
 
-				// Key/Value
-				auto eq_pos = line.find('=');
-				if (eq_pos == std::string::npos) continue;
+				std::ifstream file(configFile);
+				if (!file.is_open())
+				{
+					LOG::WARN("Could not read the Config File at: {}", configFile.string());
+					a_log.critical("\tCould not read the Config File at: {}", configFile.string());
+					return;
+				}
 
-				std::string key = line.substr(0, eq_pos);
-				std::string value = line.substr(eq_pos + 1);
+				Section* currentSection = nullptr;
+				std::string line;
 
-				// Strip Inline Comments
-				auto comment_pos = value.find_first_of("#;");
-				if (comment_pos != std::string::npos)
-					value = value.substr(0, comment_pos);
+				while (std::getline(file, line))
+				{
+					// Trim
+					trim(line);
 
-				// Trim Whitespace
-				trim(key);
-				trim(value);
+					// Ignore Empty Lines and Comments
+					if (line.empty()) continue;
+					if (line[0] == ';' || line[0] == '#') continue;
 
-				a_log.critical("\t\t{}: {}", key, value);
+					// Sections
+					if (line.front() == '[' && line.back() == ']')
+					{
+						std::string sectionName = line.substr(1, line.size() - 2);
+						trim(sectionName);
+
+						currentSection = nullptr;
+						for (auto& section : sections)
+						{
+							if (section.sectionName == sectionName)
+							{
+								currentSection = &section;
+								break;
+							}
+						}
+
+						if (!currentSection)
+						{
+							sections.push_back({ sectionName, {} });
+							currentSection = &sections.back();
+						}
+
+						continue;
+					}
+
+					// Key / Value
+					const auto eq_pos = line.find('=');
+					if (eq_pos == std::string::npos) continue;
+
+					std::string key = line.substr(0, eq_pos);
+					std::string value = line.substr(eq_pos + 1);
+
+					// Strip Inline Comments
+					const auto comment_pos = value.find_first_of("#;");
+					if (comment_pos != std::string::npos)
+						value = value.substr(0, comment_pos);
+
+					// Trim Whitespace
+					trim(key);
+					trim(value);
+
+					// Add / Override Setting
+					if (currentSection)
+						currentSection->sectionSettings[key] = value;
+				}
+			};
+
+			// Read Config Files
+			readConfig(MainConfigFile);
+			readConfig(CustomConfigFile);
+
+			// Log
+			if (!sections.empty())
+			{
+				for (const auto& section : sections)
+				{
+					a_log.critical("\t[{}]", section.sectionName);
+
+					if (section.sectionSettings.empty())
+					{
+						a_log.critical("\t\tDefault Settings");
+						continue;
+					}
+
+					for (const auto& [key, value] : section.sectionSettings)
+					{
+						a_log.critical("\t\t{}: {}", key, value);
+					}
+				}
 			}
+			else
+				a_log.critical("\tDefault Settings");
 		}
 
 		void print_settings_safeguard(spdlog::logger& a_log)
