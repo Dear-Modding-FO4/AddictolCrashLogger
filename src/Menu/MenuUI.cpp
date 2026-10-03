@@ -21,22 +21,15 @@ namespace CrashUI
 {
 	namespace
 	{
-		constexpr dmui::ClientOptions kClientOptions{
-			.capabilities = DMUI_CLIENT_CAPABILITY_NONE,
-			.requiredServices = DMUI_HOST_SERVICE_EXTERNAL_OPEN,
-			.minimumUIRevision = DMUI_UI_REVISION_1,
-			.minimumUIAPISize = DMUI_UI_API_REQUIRED_SIZE,
-			.minimumHostAPISize = DMUI_HOST_API_DRAW_SEARCH_INPUT_BUFFER_SIZE
-		};
-
 		dmui::Client s_client{
 			"dear-modding.addictol-crash-logger",
 			"Addictol Crash Logger",
 			dmui::Version{ PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR },
 			"bug-beetle",
 			{},
-			kClientOptions
+			{}
 		};
+		dmui::DialogSession s_copyDialog;
 		std::once_flag s_installOnce;
 		std::atomic_bool s_installResult{ true };
 		std::atomic_bool s_pagesOperational{ false };
@@ -61,10 +54,67 @@ namespace CrashUI
 		uint64_t s_comparisonGeneration{};
 		uint64_t s_compareValidatedIndexGeneration{};
 		std::optional<uint64_t> s_pendingComparisonCopy;
-		std::string s_comparisonActionStatus;
 		SettingsPageState s_settingsState;
 		uint64_t s_nextSaveOperation{ 1 };
+		uint64_t s_notifiedSaveOperation{};
 		uint64_t s_settingsViewGeneration{};
+
+		void NotifyAction(DMUI_StatusSeverity a_severity, const char* a_message)
+		{
+			if (!s_client.PostNotification(a_severity, a_message))
+				REX::WARN(
+					"Crash Logger UI: notification failed, result {}."sv,
+					DMUI_ResultToString(s_client.LastResult()));
+		}
+
+		[[nodiscard]] std::optional<std::string> CopyText(std::string_view a_text)
+		{
+			const auto result = dmui::ui::checked::SetClipboardText(
+				a_text.data(), a_text.size());
+			if (result != DMUI_RESULT_OK)
+			{
+				const auto error = std::format(
+					"Clipboard copy failed ({}).", DMUI_ResultToString(result));
+				NotifyAction(DMUI_STATUS_SEVERITY_ERROR, error.c_str());
+				return error;
+			}
+			NotifyAction(DMUI_STATUS_SEVERITY_SUCCESS, "Copied to clipboard.");
+			return std::nullopt;
+		}
+
+		void ConfirmCopy(const char* a_warning, dmui::DialogSession::Submit a_submit)
+		{
+			if (!s_copyDialog.Open(
+					s_client,
+					{
+						.kind = DMUI_DIALOG_KIND_CONFIRM,
+						.title = "Copy potentially sensitive data?",
+						.body = a_warning,
+						.acceptLabel = "Copy",
+						.cancelLabel = "Cancel"
+					},
+					std::move(a_submit)))
+			{
+				const auto error = std::format(
+					"Copy confirmation could not open ({}).",
+					DMUI_ResultToString(s_copyDialog.LastResult()));
+				NotifyAction(DMUI_STATUS_SEVERITY_ERROR, error.c_str());
+			}
+		}
+
+		void PollCopyDialog()
+		{
+			if (!s_copyDialog.Active())
+				return;
+			s_copyDialog.Poll();
+			if (s_copyDialog.LastResult() != DMUI_RESULT_OK)
+			{
+				const auto error = std::format(
+					"Copy confirmation failed ({}).",
+					DMUI_ResultToString(s_copyDialog.LastResult()));
+				NotifyAction(DMUI_STATUS_SEVERITY_ERROR, error.c_str());
+			}
+		}
 
 		void ReportPresentationFailure() noexcept
 		{
@@ -517,16 +567,16 @@ namespace CrashUI
 			}
 
 			(void)s_client.DrawSectionHeader("Explicit local actions");
-			(void)dmui::DrawStyledText(
-				s_client,
-				"Raw report text can contain paths, load-order details, memory "
-				"strings, and other sensitive data. Nothing is copied automatically.",
-				{ .tone = dmui::TextTone::kWarning, .wrapped = true });
 			const auto copyLabel = a_read->truncated ?
 				"Copy Loaded Text (truncated; potentially sensitive)" :
 				"Copy Loaded Text (potentially sensitive)";
 			if (dmui::ui::Button(copyLabel))
-				dmui::ui::SetClipboardText(a_read->text);
+				ConfirmCopy(
+					"Raw report text can contain paths, load-order details, memory "
+					"strings, and other sensitive data. Copy the loaded text to the clipboard?",
+					[read = a_read](std::string_view) {
+						return CopyText(read->text);
+					});
 			(void)dmui::DrawStyledText(
 				s_client,
 				"Exact summary preview:",
@@ -555,7 +605,7 @@ namespace CrashUI
 					});
 			}
 			if (dmui::ui::Button("Copy Selected Summary"))
-				dmui::ui::SetClipboardText(a_read->summary);
+				(void)CopyText(a_read->summary);
 			(void)DrawOpenLink(
 				"report-open-file",
 				"Open Report",
@@ -570,6 +620,7 @@ namespace CrashUI
 
 		void DrawReports()
 		{
+			PollCopyDialog();
 			if (!s_pagesOperational.load(std::memory_order_acquire))
 			{
 				DrawUnavailable();
@@ -710,41 +761,36 @@ namespace CrashUI
 			}
 
 			(void)s_client.DrawSectionHeader("Explicit local actions");
-			(void)dmui::DrawStyledText(
-				s_client,
-				"Comparison text contains report filenames and recorded load-order "
-				"facts. Nothing is copied automatically.",
-				{ .tone = dmui::TextTone::kWarning, .wrapped = true });
-			auto queuedCopy = false;
 			if (dmui::ui::Button("Copy comparison after revalidation"))
 			{
-				queuedCopy = true;
-				s_pendingComparisonCopy = a_comparison.comparisonGeneration;
-				s_comparisonActionStatus =
-					"Copy requested; waiting for file identity revalidation.";
-				ReportRepository::GetSingleton().RequestComparisonValidation(
-					a_comparison.comparisonGeneration);
+				ConfirmCopy(
+					"Comparison text contains report filenames and recorded load-order "
+					"facts. Revalidate the selected files and copy the comparison to the clipboard?",
+					[generation = a_comparison.comparisonGeneration](std::string_view)
+						-> std::optional<std::string> {
+						if (generation != s_comparisonGeneration)
+							return "The selected comparison changed. Cancel and compare again.";
+						s_pendingComparisonCopy = generation;
+						ReportRepository::GetSingleton().RequestComparisonValidation(generation);
+						return std::nullopt;
+					});
 			}
-			if (!queuedCopy &&
-				s_pendingComparisonCopy ==
+			if (s_pendingComparisonCopy ==
 					a_comparison.comparisonGeneration &&
 				!a_comparison.validationPending)
 			{
 				if (a_comparison.validated && !a_comparison.stale)
-				{
-					dmui::ui::SetClipboardText(a_comparison.summary);
-					s_comparisonActionStatus =
-						"Validated comparison copied.";
-				}
+					(void)CopyText(a_comparison.summary);
 				else
-					s_comparisonActionStatus =
-						"Copy cancelled because a selected report changed.";
+					NotifyAction(
+						DMUI_STATUS_SEVERITY_WARNING,
+						"Copy cancelled because a selected report changed.");
 				s_pendingComparisonCopy.reset();
 			}
-			if (!s_comparisonActionStatus.empty())
+			if (s_pendingComparisonCopy)
 				(void)dmui::DrawStyledText(
 					s_client,
-					s_comparisonActionStatus,
+					"Copy requested; waiting for file identity revalidation.",
 					{ .tone = dmui::TextTone::kMuted, .wrapped = true });
 		}
 
@@ -752,6 +798,7 @@ namespace CrashUI
 		{
 			try
 			{
+				PollCopyDialog();
 				if (!s_pagesOperational.load(std::memory_order_acquire))
 				{
 					DrawUnavailable();
@@ -772,7 +819,6 @@ namespace CrashUI
 					repository.MarkComparisonStale();
 					s_compareValidatedIndexGeneration = 0;
 					s_pendingComparisonCopy.reset();
-					s_comparisonActionStatus.clear();
 				}
 				if (index->loading)
 					(void)dmui::DrawStyledText(s_client, "Indexing reports...");
@@ -804,7 +850,6 @@ namespace CrashUI
 					++s_comparisonGeneration;
 					s_compareValidatedIndexGeneration = 0;
 					s_pendingComparisonCopy.reset();
-					s_comparisonActionStatus.clear();
 					repository.MarkComparisonStale(s_comparisonGeneration);
 				}
 				const auto left = FindReport(*index, s_compareLeft);
@@ -823,7 +868,6 @@ namespace CrashUI
 					++s_comparisonGeneration;
 					s_compareValidatedIndexGeneration = index->generation;
 					s_pendingComparisonCopy.reset();
-					s_comparisonActionStatus.clear();
 					repository.RequestComparison(
 						*left,
 						*right,
@@ -987,7 +1031,7 @@ namespace CrashUI
 					(void)s_client.DrawSectionHeader("Compact status");
 					dmui::ui::TextUnformatted(snapshot->compactSummary);
 					if (dmui::ui::Button("Copy compact status"))
-						dmui::ui::SetClipboardText(snapshot->compactSummary);
+						(void)CopyText(snapshot->compactSummary);
 				}
 				ReportPresentationFailure();
 			}
@@ -1277,6 +1321,14 @@ namespace CrashUI
 				SettingsRepository::GetSingleton().Snapshot();
 			const auto& snapshot = state.settings;
 			const auto& saveResult = state.saveResult;
+			if (saveResult && saveResult->operation != s_notifiedSaveOperation)
+			{
+				s_notifiedSaveOperation = saveResult->operation;
+				NotifyAction(
+					saveResult->success ? DMUI_STATUS_SEVERITY_SUCCESS :
+						DMUI_STATUS_SEVERITY_ERROR,
+					saveResult->message.c_str());
+			}
 			s_settingsState.Reconcile(
 				*snapshot,
 				saveResult ? &*saveResult : nullptr);
@@ -1307,11 +1359,6 @@ namespace CrashUI
 				a_page.notes.push_back({
 					"Apply is disabled: " + snapshot->error,
 					false
-				});
-			if (!snapshot->saveMessage.empty())
-				a_page.notes.push_back({
-					snapshot->saveMessage,
-					snapshot->lastSaveSucceeded
 				});
 			const auto startup = GetStartupSnapshot();
 			if (!snapshot->loading && snapshot->configurationValid &&
@@ -1346,7 +1393,7 @@ namespace CrashUI
 						{
 							if (!error.empty())
 							{
-								(void)s_client.SetStatus(
+								NotifyAction(
 									DMUI_STATUS_SEVERITY_ERROR,
 									error.c_str());
 								REX::WARN(
@@ -1360,7 +1407,7 @@ namespace CrashUI
 							s_settingsState.CancelApply(operation);
 							REX::WARN(
 								"Crash Logger UI settings: save queue is busy."sv);
-							(void)s_client.SetStatus(
+							NotifyAction(
 								DMUI_STATUS_SEVERITY_WARNING,
 								"Settings save queue is busy.");
 						}
@@ -1388,6 +1435,10 @@ namespace CrashUI
 
 		void OnPageActivity(const dmui::PageActivity& a_activity)
 		{
+			if (a_activity.kind == dmui::PageActivityKind::kDeactivated ||
+				a_activity.previousPage == s_reportsPage ||
+				a_activity.previousPage == s_comparePage)
+				s_copyDialog.Cancel();
 			if (a_activity.kind == dmui::PageActivityKind::kActivated ||
 				a_activity.kind == dmui::PageActivityKind::kChanged)
 			{
@@ -1458,7 +1509,10 @@ namespace CrashUI
 			}
 			if (a_activity.kind == dmui::PageActivityKind::kDeactivated ||
 				a_activity.previousPage == s_comparePage)
+			{
 				s_compareActivated = false;
+				s_pendingComparisonCopy.reset();
+			}
 		}
 
 		[[nodiscard]] bool RegisterPages() noexcept
@@ -1614,8 +1668,8 @@ namespace CrashUI
 			}
 			RegisterOptionalPages();
 			REX::INFO(
-				"Crash Logger UI: connected to DearModdingUI API revision {}."sv,
-				DMUI_UI_REVISION_1);
+				"Crash Logger UI: connected to DearModdingUI ABI {}."sv,
+				DMUI_ABI_VERSION);
 		});
 		return s_installResult.load(std::memory_order_relaxed);
 	}

@@ -5,19 +5,21 @@ Supports all major game versions [OG (1.10.163.0), NG (1.10.984.0) and AE (1.11.
 
 ## Optional in-game UI
 
-Install [DearModdingUI](https://github.com/Dear-Modding-FO4/DearModdingUI) separately
+Install [DearModdingUI](https://github.com/Dear-Modding-FO4/DearModdingUI) (ABI 2) separately
 for in-game pages:
 
 * **Home:** logger status, versions, and report locations.
 * **Reports:** browse, search, open, and copy saved crash/thread reports. The shared
   DMUI text reader scrolls to sections and highlights search matches. Previews
   are limited to 2 MiB; open the original file for the full report.
+  Copying raw text requires confirmation because reports can contain sensitive data.
 * **Settings:** edit configuration with Reset, Revert, and Apply. Changes are saved
   to `Data\F4SE\Plugins\AddictolCrashLoggerCustom.toml` for the **next game launch**.
   Leaving the page discards unapplied edits.
 * **Compare:** compare the facts recorded in two saved reports without changing
   either file. Missing, partial, ambiguous or unsupported data is not treated as
   proof that a module or plugin was absent.
+  Copying comparison text requires confirmation and file identity revalidation.
 * **Diagnostics:** explicitly probe local symbols for the current executable.
   Results describe the current installation, not an older crash. The probe opens
   validated local PDB candidates directly; it does not download symbols or follow
