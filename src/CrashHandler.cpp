@@ -5,6 +5,7 @@
 #include "CppException/CppException.h"
 #include "Introspection/Introspection.h"
 #include "Introspection/RelevantObjectsSimplifier.h"
+#include "MissingMasters.h"
 #include "Modules/ModuleHandler.h"
 #include "PDB/PdbHandler.h"
 #include "ThreadDump/ThreadDump.h"
@@ -1202,6 +1203,26 @@ namespace Crash
 			}
 		}
 
+		void print_missing_masters(spdlog::logger& a_log)
+		{
+			for (const auto& line : MissingMasters::Diagnose())
+			{
+				a_log.critical("{}"sv, line);
+			}
+		}
+
+		void print_missing_masters_safeguard(spdlog::logger& a_log)
+		{
+			__try
+			{
+				print_missing_masters(a_log);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				a_log.critical("print_missing_masters failed!");
+			}
+		}
+
 		void print_relevant_objects_section(spdlog::logger& a_log, const RelevantObjectsCollection& collection)
 		{
 			a_log.critical("POSSIBLE RELEVANT OBJECTS:"sv);
@@ -2019,6 +2040,7 @@ namespace Crash
 				print([&]() { print_modules_safeguard(*log, cmodules); }, "print_modules");
 				print([&]() { print_xse_plugins_safeguard(*log, cmodules); }, "print_xse_plugins");
 				print([&]() { print_plugins_safeguard(*log); }, "print_plugins");
+				print([&]() { print_missing_masters_safeguard(*log); }, "print_missing_masters");
 
 				// Ensure all log data is written to disk before we try to open the file
 				log->flush();
