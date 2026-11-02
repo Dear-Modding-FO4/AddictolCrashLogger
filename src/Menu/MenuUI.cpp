@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <compare>
 #include <format>
 #include <limits>
 
@@ -306,6 +307,77 @@ namespace CrashUI
 				dmui::ContainsFolded(a_record.basename, s_reportFilter);
 		}
 
+		constexpr size_t kVisibleReportRows{ 10 };
+		constexpr int32_t kDumpColumn{ 4 };
+		constexpr uint32_t kTableSortAndBgAbiMinor{ 2u };
+
+		[[nodiscard]] std::weak_ordering CompareReportColumn(
+			const ReportRecord& a_left,
+			const ReportRecord& a_right,
+			int32_t a_column)
+		{
+			switch (a_column)
+			{
+			case 0:
+				return a_left.basename <=> a_right.basename;
+			case 1:
+				return a_left.kind <=> a_right.kind;
+			case 2:
+				if (const auto order =
+						a_left.recordedTimestamp <=> a_right.recordedTimestamp;
+					order != 0)
+					return order;
+				return a_left.basename <=> a_right.basename;
+			case 3:
+				return a_left.size <=> a_right.size;
+			case kDumpColumn:
+				return a_left.hasMiniDump <=> a_right.hasMiniDump;
+			default:
+				return std::weak_ordering::equivalent;
+			}
+		}
+
+		// Stable so ties keep the index's newest-first order.
+		void SortReportRows(
+			std::vector<const ReportRecord*>& a_rows,
+			std::span<const DMUI_UITableSortSpec> a_specs)
+		{
+			if (a_specs.empty())
+				return;
+			std::ranges::stable_sort(
+				a_rows,
+				[&](const ReportRecord* a_left, const ReportRecord* a_right) {
+					for (const auto& spec : a_specs)
+					{
+						const auto order =
+							CompareReportColumn(*a_left, *a_right, spec.column);
+						if (order != 0)
+							return spec.direction ==
+									DMUI_UI_SORT_DIRECTION_DESCENDING ?
+								order > 0 :
+								order < 0;
+					}
+					return false;
+				});
+		}
+
+		struct ReportTintColors
+		{
+			dmui::ui::Color32 crashRow{};
+			dmui::ui::Color32 threadDumpRow{};
+			dmui::ui::Color32 pairedDump{};
+		};
+
+		[[nodiscard]] ReportTintColors ReportTints()
+		{
+			const auto theme = dmui::ui::GetThemeColors();
+			return {
+				.crashRow = dmui::ui::GetColorU32(theme.error, 0.12f),
+				.threadDumpRow = dmui::ui::GetColorU32(theme.info, 0.12f),
+				.pairedDump = dmui::ui::GetColorU32(theme.success, 0.3f)
+			};
+		}
+
 		void DrawReportList(
 			const std::shared_ptr<const ReportIndexSnapshot>& a_index)
 		{
@@ -346,24 +418,66 @@ namespace CrashUI
 					s_client,
 					"No timestamp-named crash or thread-dump reports were found.");
 
+			std::vector<const ReportRecord*> rows;
+			for (const auto& report : a_index->reports)
+				if (MatchesReportFilter(report))
+					rows.push_back(std::addressof(report));
+
+			// Bounded so the selected report's details stay on screen.
+			const auto style = s_client.GetStyleMetrics();
+			const auto rowHeight = dmui::ui::GetFontSize() +
+				(style ? style->cellPadding.y * 2.0f : 0.0f);
+			const auto visibleRows = std::min<size_t>(
+				rows.size(), kVisibleReportRows);
+			const auto tableHeight =
+				rowHeight * static_cast<float>(visibleRows + 1) + 2.0f;  // borders
+			const auto sortAndBg =
+				s_client.AbiMinor() >= kTableSortAndBgAbiMinor;
+			auto flags = dmui::ui::TableFlags::kRowBg |
+				dmui::ui::TableFlags::kBorders |
+				dmui::ui::TableFlags::kSizingStretchProp |
+				dmui::ui::TableFlags::kScrollY;
+			if (sortAndBg)
+				flags |= dmui::ui::TableFlags::kSortable;
 			if (!dmui::ui::BeginTable(
 					"reports",
 					5,
-					dmui::ui::TableFlags::kRowBg |
-						dmui::ui::TableFlags::kBorders |
-						dmui::ui::TableFlags::kSizingStretchProp))
+					flags,
+					{ 0.0f, tableHeight }))
 				return;
 			dmui::ui::TableSetupColumn("Report");
 			dmui::ui::TableSetupColumn("Kind");
-			dmui::ui::TableSetupColumn("Timestamp");
+			dmui::ui::TableSetupColumn(
+				"Timestamp",
+				dmui::ui::TableColumnFlags::kDefaultSort |
+					dmui::ui::TableColumnFlags::kPreferSortDescending);
 			dmui::ui::TableSetupColumn("Size");
 			dmui::ui::TableSetupColumn("Dump");
+			dmui::ui::TableSetupScrollFreeze(0, 1);
 			dmui::ui::TableHeadersRow();
-			for (const auto& report : a_index->reports)
+			std::optional<ReportTintColors> tints;
+			if (sortAndBg)
 			{
-				if (!MatchesReportFilter(report))
-					continue;
+				SortReportRows(rows, dmui::ui::TableGetSortSpecs());
+				tints = ReportTints();
+			}
+			for (const auto* row : rows)
+			{
+				const auto& report = *row;
 				dmui::ui::TableNextRow();
+				if (tints)
+				{
+					dmui::ui::TableSetBgColor(
+						dmui::ui::TableBgTarget::kRowBg1,
+						report.kind == ReportKind::kCrash ?
+							tints->crashRow :
+							tints->threadDumpRow);
+					if (report.hasMiniDump)
+						dmui::ui::TableSetBgColor(
+							dmui::ui::TableBgTarget::kCell,
+							tints->pairedDump,
+							kDumpColumn);
+				}
 				(void)dmui::ui::TableSetColumnIndex(0);
 				const auto selected = report.path == s_selectedReport;
 				if (dmui::ui::Selectable(
@@ -392,7 +506,7 @@ namespace CrashUI
 				dmui::ui::TextUnformatted(report.recordedTimestamp);
 				(void)dmui::ui::TableSetColumnIndex(3);
 				dmui::ui::TextUnformatted(std::format("{} bytes", report.size));
-				(void)dmui::ui::TableSetColumnIndex(4);
+				(void)dmui::ui::TableSetColumnIndex(kDumpColumn);
 				dmui::ui::TextUnformatted(report.hasMiniDump ? "Paired" : "No");
 			}
 			dmui::ui::EndTable();
@@ -1668,8 +1782,9 @@ namespace CrashUI
 			}
 			RegisterOptionalPages();
 			REX::INFO(
-				"Crash Logger UI: connected to DearModdingUI ABI {}."sv,
-				DMUI_ABI_VERSION);
+				"Crash Logger UI: connected to DearModdingUI ABI {}.{}."sv,
+				DMUI_ABI_MAJOR,
+				s_client.AbiMinor());
 		});
 		return s_installResult.load(std::memory_order_relaxed);
 	}

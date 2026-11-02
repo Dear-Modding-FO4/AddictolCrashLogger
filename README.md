@@ -25,7 +25,8 @@ for in-game pages:
   validated local PDB candidates directly; it does not download symbols or follow
   embedded source paths.
 
-The Reports table keeps its existing columns and interactions. Search, section
+The Reports table shows ten rows at a time, newest first; on DearModdingUI 0.2.2+
+it sorts by column and tints crash, thread-dump and minidump entries. Search, section
 navigation and summary improvements are confined to the selected-report details.
 Comparison uses the existing text reports, with no metadata sidecars or database.
 Diagnostic and comparison cancellation abandons the request; an active synchronous
